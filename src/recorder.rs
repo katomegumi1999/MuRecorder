@@ -348,7 +348,7 @@ impl Recorder {
         self.env.stop.store(true, Ordering::SeqCst);
 
         // 先取出句柄再 join，避免与 self.env 的 &self 借用冲突。
-        let handles: Vec<JoinHandle<()>> = self.threads.drain(..).collect();
+        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut self.threads);
         for handle in handles {
             let name = handle.thread().name().unwrap_or("?").to_string();
             if let Err(e) = handle.join() {

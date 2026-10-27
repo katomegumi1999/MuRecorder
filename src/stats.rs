@@ -32,6 +32,23 @@ pub const ENCODER_GPU_H264: u32 = 2; // GPU H.264 (AVC)
 pub const ENCODER_SOFT_OPENH264: u32 = 4; // 与 C 侧 encoder=4 (x264/soft) 对齐
 pub const ENCODER_GPU_AV1: u32 = 5; // GPU AV1
 
+/// 饱和自减：计数到 0 就停，不会回绕成 `usize::MAX`。
+///
+/// 不用 `AtomicUsize::fetch_update`：新版本 stable 已把它改名为 `try_update`
+/// 并弃用旧名（`-D warnings` 下直接编译失败），而 `try_update` 在 MSRV 1.85
+/// 上还不存在——两端各有一半环境不可用。这里手写 CAS 循环，语义相同且与
+/// 工具链版本无关。
+#[inline]
+fn saturating_dec(counter: &AtomicUsize) {
+    let mut cur = counter.load(Ordering::Relaxed);
+    while cur > 0 {
+        match counter.compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 /// 热路径计数器（无锁）。
 #[derive(Debug, Default)]
 pub struct AtomicStats {
@@ -59,22 +76,14 @@ impl AtomicStats {
         self.frames_encoded.fetch_add(1, Ordering::Relaxed);
         self.bytes_encoded.fetch_add(bytes, Ordering::Relaxed);
         // 防止在 0 下方回绕（异常路径理论不可达，防御性处理）。
-        let _ = self
-            .queue_depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
+        saturating_dec(&self.queue_depth);
     }
 
     #[inline]
     pub fn on_frame_dropped(&self) {
         self.frames_dropped.fetch_add(1, Ordering::Relaxed);
         // 丢弃的帧从未进入编码队列，只需抵消入队时的 +1。
-        let _ = self
-            .queue_depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
+        saturating_dec(&self.queue_depth);
     }
 
     #[inline]
