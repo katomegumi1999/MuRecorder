@@ -199,7 +199,7 @@ impl StatsSampler {
 mod tests {
     use super::*;
     use std::thread::sleep;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn counters_track_queue_depth() {
@@ -219,30 +219,46 @@ mod tests {
     #[test]
     fn sampler_computes_rates() {
         let sampler = StatsSampler::new(ENCODER_SOFT_OPENH264);
-        // 第一个采样窗口前先记一帧，制造 200ms 内 5 帧 / 5120 字节
-        // → 25 fps、5120 B / 0.2 s × 8 = 204.8 kbit/s
+        // 第一个采样窗口前先记一帧，后面再记 5 帧 / 5120 字节。
         sampler.stats().on_frame_captured();
         sampler.stats().on_frame_encoded(1024);
         sampler.sample();
+
+        // 期望值按**实测窗口**推算，而不是假设 sleep 恰好睡了 200 ms。
+        // 这条断言原本写死「200ms → 25 fps / 204.8 kbit/s」，可是机器一忙
+        // （例如同时在编译另一个 workspace）sleep 就会超到 220 ms 以上，
+        // 码率随之跌到 186 kbit/s、fps 跌到 22 以下，于是随机假失败。
+        // 该用例要验的是「计数器 → 速率」的换算公式，不是 OS 的睡眠精度。
+        let window = Instant::now();
         sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
         for _ in 0..5 {
             sampler.stats().on_frame_captured();
             sampler.stats().on_frame_encoded(1024);
         }
         sampler.sample();
+        let dt_ms = window.elapsed().as_millis().max(1);
 
         let snap = sampler.snapshot();
         assert_eq!(snap.frames_encoded, 6);
         assert_eq!(snap.encoder_type, ENCODER_SOFT_OPENH264);
+
+        // sample() 内部用自己的 Instant 取窗口，与上面的起点差两次取时的开销，
+        // 整除截断也可能差 1，所以允许 ±2。
+        let expect_fps = (5u128 * 1000 / dt_ms) as u32;
+        let expect_kbps = (5 * 1024u128 * 8_000 / dt_ms / 1_000) as u32;
         assert!(
-            snap.current_fps >= 20 && snap.current_fps <= 30,
-            "fps={}",
-            snap.current_fps
+            snap.current_fps.abs_diff(expect_fps) <= 2,
+            "fps={} 期望≈{}（实测窗口 {} ms）",
+            snap.current_fps,
+            expect_fps,
+            dt_ms
         );
         assert!(
-            (190..=215).contains(&snap.bitrate_kbps),
-            "kbps={}（5120 B / 200 ms ≈ 204.8 kbit/s）",
-            snap.bitrate_kbps
+            snap.bitrate_kbps.abs_diff(expect_kbps) <= 2,
+            "kbps={} 期望≈{}（实测窗口 {} ms）",
+            snap.bitrate_kbps,
+            expect_kbps,
+            dt_ms
         );
         assert!(snap.elapsed_ms >= SAMPLE_INTERVAL_MS);
     }
