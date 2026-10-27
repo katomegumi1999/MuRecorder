@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    # 本 crate 用 windows-rs 与 D3D11/MF，只能在 Windows 上构建。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        # 排除需要真实硬件编码器的用例：GitHub runner 只有基础显示适配器，
+        # 该用例在有 GPU 的机器上可用 `cargo test -- --ignored` 之类方式单独跑。
+        run: cargo test --all-targets -- --skip test_gpu_sink_writer_pipeline
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: recorder_core-x86_64-pc-windows-msvc
+          path: |
+            target/release/recorder_core.dll
+            include/recorder.h

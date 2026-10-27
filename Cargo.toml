@@ -1,0 +1,65 @@
+[package]
+name = "murecorder-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Windows screen-recording engine: DXGI Desktop Duplication capture, Media Foundation hardware encoding (H.264 / HEVC / AV1) with a pure-CPU OpenH264 fallback, and a crash-safe Hybrid MP4 muxer. Exposed as a C ABI cdylib."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/katomegumi1999/MuRecorder"
+keywords = ["screen-recording", "dxgi", "media-foundation", "mp4", "video"]
+categories = ["multimedia::video", "os::windows-apis"]
+
+[lib]
+name = "recorder_core"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# Windows API 绑定。feature 按需裁剪，避免拉入整个 SDK 头文件集合。
+# 覆盖 DXGI 桌面复制、D3D11（含 VideoProcessor 显存内 BGRA→NV12）、
+# Media Foundation SinkWriter 与自定义 IMFMediaSink、QPC 计时、高精度定时器。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D10",
+    "Win32_Graphics_Direct3D11",
+    # DXGI_OUTPUT_DESC 内含 HMONITOR，GetDesc 需要 Gdi feature
+    "Win32_Graphics_Gdi", "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Performance",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    # 自己实现 IMFMediaSink / IMFStreamSink 需要这两个：前者的方法签名带
+    # PROPVARIANT（System_Variant），后者在 Com_StructuredStorage 里定义
+    # （PROPVARIANT 本体，以及 IMFStreamSink_Impl / IMFMediaEventGenerator_Impl
+    #  都按 `all(Com_StructuredStorage, System_Variant)` 门控）。
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    # CreateWaitableTimerExW 的签名带 SECURITY_ATTRIBUTES，被 Win32_Security 门控；
+    # 用于高精度帧率配速（CREATE_WAITABLE_TIMER_HIGH_RESOLUTION）。
+    "Win32_Security",
+] }
+# `#[implement(...)]` 宏展开后用的是 `::windows_core::` **绝对路径**，所以除了
+# `windows` 之外必须把 `windows-core` 也作为直接依赖引入（版本要与 windows 一致，
+# 否则两边的 IUnknown / Result 类型对不上）。
+windows-core = "0.62.2"
+# 软件 H.264 编码器（Cisco OpenH264）。默认 feature `source` 会用 `cc` 把上游 C 源码
+# 静态编译进来（openh264-sys2 内 27 个 .c），因此:① 首次构建需要 C 工具链(本机为 MSVC);
+# ② 产物自包含，运行期不依赖外部 openh264.dll。注意它不是纯 Rust 实现。
+# 硬件编码器可用时优先走硬件路径，本 crate 是回退链末位。
+openh264 = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+# 注意：release profile 必须保持 panic = "unwind"（即默认，不显式设置）。
+# FFI 边界每个导出函数都用 catch_unwind 包裹，panic 必须能被捕获转成
+# REC_ERR_PANIC 返回给 C#；若像 MuClip 那样设 panic = "abort"，
+# catch_unwind 会直接中止进程，跨不过 FFI 边界。
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = true

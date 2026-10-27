@@ -1,0 +1,22 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# 录制产物与调试中间文件
+*.mp4
+*.mkv
+*.partial
+
+# 临时脚本 / 探针
+/scratch/
+
+# 本地工作区数据（助手记忆、会话记录），不随源码发布
+/.workbuddy/
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+desktop.ini
