@@ -163,26 +163,37 @@ impl CursorShape {
         }
     }
 
-    /// 把光标合成到 BGRA 画面上的 `(dst_x, dst_y)` 处。
+    /// 把光标合成到画布上的 `(dst_x, dst_y)` 处（完全不透明）。
     ///
-    /// `dst` 是 `dst_h` 行、每行 `dst_stride` 字节的区域画面（紧凑行距时
-    /// `dst_stride == dst_w * 4`）。`dst_x/dst_y` 是**光标左上角**在 `dst` 坐标系里的
-    /// 位置，允许为负或越界——落在画面外的部分会被裁掉，不做任何假设。
+    /// 语义与 [`Self::blend_into_alpha`] 相同，只是 `alpha` 固定为 255。
+    #[inline]
+    pub fn blend_into(&self, canvas: &mut Canvas<'_>, dst_x: i32, dst_y: i32) -> usize {
+        self.blend_into_alpha(canvas, dst_x, dst_y, 255)
+    }
+
+    /// 按整体不透明度 `alpha` 合成光标。
     ///
-    /// 返回实际参与合成的像素数（0 表示完全在画面外），便于上层判断「这帧是否
+    /// `alpha` 是「这个副本本身有多不透明」，与 `COLOR` 形状自带的逐像素 alpha 相乘：
+    /// 轨迹残影就是靠它做年龄衰减的。0 表示完全不画。
+    ///
+    /// `dst_x/dst_y` 是**光标左上角**在画布坐标系里的位置，允许为负或越界——
+    /// 落在画布外的部分会被裁掉，不做任何假设。
+    /// 返回实际参与合成的像素数（0 表示完全在画布外），便于上层判断「这帧是否
     /// 真的需要重编码」。
-    pub fn blend_into(
+    pub fn blend_into_alpha(
         &self,
-        dst: &mut [u8],
-        dst_stride: usize,
-        dst_w: u32,
-        dst_h: u32,
+        canvas: &mut Canvas<'_>,
         dst_x: i32,
         dst_y: i32,
+        alpha: u8,
     ) -> usize {
-        if dst_stride < dst_w as usize * 4 {
+        let dst_stride = canvas.stride;
+        let dst_w = canvas.width;
+        let dst_h = canvas.height;
+        if alpha == 0 || dst_stride < dst_w as usize * 4 {
             return 0;
         }
+        let dst: &mut [u8] = canvas.buf;
         let reachable_h = dst.len() / dst_stride;
         let rows = (dst_h as usize).min(reachable_h);
         if rows == 0 {
@@ -210,9 +221,18 @@ impl CursorShape {
                     continue;
                 }
                 let px = [dst[off], dst[off + 1], dst[off + 2]];
-                let Some(out) = self.sample(sx, sy, px) else {
+                let Some(mut out) = self.sample(sx, sy, px) else {
                     continue;
                 };
+                // 整体不透明度：把这个副本的结果再与桌面按 alpha 混一次。
+                // 对 COLOR 形状而言等于逐像素 alpha 再乘一个系数（近似，但视觉一致）。
+                if alpha < 255 {
+                    let a = alpha as u32;
+                    let inv = 255 - a;
+                    for c in 0..3 {
+                        out[c] = ((out[c] as u32 * a + px[c] as u32 * inv) / 255) as u8;
+                    }
+                }
                 dst[off] = out[0];
                 dst[off + 1] = out[1];
                 dst[off + 2] = out[2];
@@ -286,6 +306,31 @@ impl CursorShape {
     }
 }
 
+/// 一块可写的 BGRA 画布。
+///
+/// 为什么把尺寸显式带着走、而不是从 `buf.len()` 反推：GPU 路径回读的 staging 纹理
+/// 行距由驱动按 256 字节对齐，`stride != width * 4` 是**常态**；只给一个切片，
+/// 接收方根本不知道一行在哪结束。
+pub struct Canvas<'a> {
+    pub buf: &'a mut [u8],
+    /// 行距（字节），可能大于 `width * 4`
+    pub stride: usize,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl<'a> Canvas<'a> {
+    #[inline]
+    pub fn new(buf: &'a mut [u8], stride: usize, width: u32, height: u32) -> Self {
+        Self {
+            buf,
+            stride,
+            width,
+            height,
+        }
+    }
+}
+
 /// 指针当下的位置与可见性（**已被换算到录制区域坐标系**）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PointerState {
@@ -293,49 +338,6 @@ pub struct PointerState {
     /// 光标图像左上角，相对录制区域左上角的像素偏移；可为负（部分在区域外）
     pub x: i32,
     pub y: i32,
-}
-
-/// 交给下游合成的一帧指针信息。
-///
-/// `shape` 为 `None` 表示「还没收到过任何形状」——此时不该画任何东西，
-/// 而不是画一个占位方块。
-#[derive(Clone, Copy)]
-pub struct PointerFrame<'a> {
-    pub state: PointerState,
-    pub shape: Option<&'a CursorShape>,
-}
-
-impl PointerFrame<'_> {
-    /// 是否真的会画出像素（可见 + 有形状）。
-    pub fn is_drawable(&self) -> bool {
-        self.state.visible && self.shape.is_some()
-    }
-}
-
-/// 光标在画面内实际覆盖的矩形 `(x, y, w, h)`；完全落在画面外时返回 `None`。
-///
-/// 单独抽出来是因为 GPU 路径要拿它当「回读包围盒」用：只需要把这一小块从显存
-/// 读回 CPU 合成，而不是整帧。CPU 路径的 [`CursorShape::blend_into`] 自己会裁剪，
-/// 两条路由此共享同一套边界判断，不会一处写「部分可见」另一处当「完全不可见」。
-pub fn overlay_rect(
-    state: PointerState,
-    shape: &CursorShape,
-    frame_w: u32,
-    frame_h: u32,
-) -> Option<(u32, u32, u32, u32)> {
-    let left = state.x.max(0);
-    let top = state.y.max(0);
-    let right = (state.x + shape.width() as i32).min(frame_w as i32);
-    let bottom = (state.y + shape.height() as i32).min(frame_h as i32);
-    if right <= left || bottom <= top {
-        return None;
-    }
-    Some((
-        left as u32,
-        top as u32,
-        (right - left) as u32,
-        (bottom - top) as u32,
-    ))
 }
 
 #[cfg(test)]
@@ -393,7 +395,7 @@ mod tests {
         for _ in 0..8 {
             dst.extend_from_slice(&[desktop[0], desktop[1], desktop[2], 0xFF]);
         }
-        let touched = shape.blend_into(&mut dst, 8 * 4, 8, 1, 0, 0);
+        let touched = shape.blend_into(&mut Canvas::new(&mut dst, 8 * 4, 8, 1), 0, 0);
         assert_eq!(touched, 8, "8 列应全部参与合成");
 
         let px = |i: usize| (dst[i * 4], dst[i * 4 + 1], dst[i * 4 + 2]);
@@ -418,7 +420,7 @@ mod tests {
         assert_eq!(shape.height(), 2);
 
         let mut dst = vec![0x40u8; 8 * 2 * 4];
-        shape.blend_into(&mut dst, 8 * 4, 8, 2, 0, 0);
+        shape.blend_into(&mut Canvas::new(&mut dst, 8 * 4, 8, 2), 0, 0);
         // 第 0 行：AND=0xFF（保留桌面）、XOR=0x00 → 桌面原样
         assert_eq!(&dst[0..4], &[0x40, 0x40, 0x40, 0xFF]);
         // 第 1 行：AND=0x00（清黑）、XOR=0xFF → 纯白
@@ -463,7 +465,7 @@ mod tests {
         // 纯红、alpha=128，压在纯蓝桌面上
         let shape = color_shape(1, 1, &[[0, 0, 255, 128]]);
         let mut dst = vec![255u8, 0, 0, 0xFF]; // BGRA: B=255 蓝
-        shape.blend_into(&mut dst, 4, 1, 1, 0, 0);
+        shape.blend_into(&mut Canvas::new(&mut dst, 4, 1, 1), 0, 0);
         // B = (0*128 + 255*127)/255 = 127；R = (255*128 + 0*127)/255 = 128
         assert_eq!(dst[0], 127, "蓝通道应按 alpha 衰减一半");
         assert_eq!(dst[2], 128, "红通道应按 alpha 混入一半");
@@ -474,7 +476,7 @@ mod tests {
     fn color_handles_fully_transparent_and_opaque() {
         let shape = color_shape(2, 1, &[[9, 9, 9, 0], [7, 8, 10, 255]]);
         let mut dst = vec![0x40u8; 2 * 4];
-        shape.blend_into(&mut dst, 2 * 4, 2, 1, 0, 0);
+        shape.blend_into(&mut Canvas::new(&mut dst, 2 * 4, 2, 1), 0, 0);
         assert_eq!(
             &dst[0..4],
             &[0x40, 0x40, 0x40, 0x40],
@@ -492,7 +494,7 @@ mod tests {
         let shape =
             CursorShape::parse(ty, &info(ty, 2, 1, 8, 0, 0), &data).expect("masked color 应能解析");
         let mut dst = vec![0xAAu8; 2 * 4];
-        shape.blend_into(&mut dst, 2 * 4, 2, 1, 0, 0);
+        shape.blend_into(&mut Canvas::new(&mut dst, 2 * 4, 2, 1), 0, 0);
         assert_eq!(&dst[0..3], &[0x11, 0x22, 0x33], "掩码为 0 时应直接用光标色");
         assert_eq!(&dst[4..7], &[0xA5, 0x5A, 0xAA], "掩码为 1 时应与桌面异或");
     }
@@ -503,7 +505,7 @@ mod tests {
         // 4x1 的不透明绿光标，放到 x = -2
         let shape = color_shape(4, 1, &[[0, 255, 0, 255]; 4]);
         let mut dst = vec![0u8; 4 * 4];
-        let touched = shape.blend_into(&mut dst, 4 * 4, 4, 1, -2, 0);
+        let touched = shape.blend_into(&mut Canvas::new(&mut dst, 4 * 4, 4, 1), -2, 0);
         assert_eq!(touched, 2, "左边两列在画面外，只应合成两列");
         assert_eq!(&dst[0..4], &[0, 255, 0, 0xFF], "第一列应是光标第 3 个像素");
         assert_eq!(&dst[4..8], &[0, 255, 0, 0xFF]);
@@ -515,7 +517,7 @@ mod tests {
     fn fully_outside_returns_zero_and_writes_nothing() {
         let shape = color_shape(2, 2, &[[1, 2, 3, 255]; 4]);
         let mut dst = vec![0x55u8; 2 * 2 * 4];
-        let touched = shape.blend_into(&mut dst, 2 * 4, 2, 2, 100, 100);
+        let touched = shape.blend_into(&mut Canvas::new(&mut dst, 2 * 4, 2, 2), 100, 100);
         assert_eq!(touched, 0);
         assert!(dst.iter().all(|b| *b == 0x55), "越界时画面必须保持不变");
     }
@@ -530,7 +532,7 @@ mod tests {
         assert_eq!(shape.hotspot(), (5, 7), "热点应被保留下来供上层参考");
 
         let mut dst = vec![0u8; 8 * 4];
-        shape.blend_into(&mut dst, 8 * 4, 8, 1, 3, 0);
+        shape.blend_into(&mut Canvas::new(&mut dst, 8 * 4, 8, 1), 3, 0);
         // 若错误地减掉热点，会从 x=3-5=-2 开始画，第一个可见像素会落在 x=0；
         // 正确实现应从 x=3 开始。
         assert_eq!(&dst[3 * 4..3 * 4 + 4], &[0xFF, 0xFF, 0xFF, 0xFF]);
@@ -543,40 +545,6 @@ mod tests {
         let data = vec![0u8; 64];
         assert!(CursorShape::parse(3, &info(3, 4, 4, 16, 0, 0), &data).is_none());
         assert!(CursorShape::parse(99, &info(99, 4, 4, 16, 0, 0), &data).is_none());
-    }
-
-    /// 指针状态与「能不能画」的组合语义。
-    #[test]
-    fn pointer_frame_is_drawable_requires_visible_and_shape() {
-        let shape = color_shape(1, 1, &[[0, 0, 0, 255]]);
-        let visible = PointerState {
-            visible: true,
-            x: 1,
-            y: 2,
-        };
-        assert!(
-            !PointerFrame {
-                state: visible,
-                shape: None
-            }
-            .is_drawable(),
-            "没有形状时不能画占位方块"
-        );
-        assert!(
-            !PointerFrame {
-                state: PointerState::default(),
-                shape: Some(&shape)
-            }
-            .is_drawable(),
-            "不可见时不该画"
-        );
-        assert!(
-            PointerFrame {
-                state: visible,
-                shape: Some(&shape)
-            }
-            .is_drawable()
-        );
     }
 
     /// 宽高为 0 的退化形状直接拒绝，避免下游除零/空循环。
@@ -597,58 +565,5 @@ mod tests {
             )
             .is_none()
         );
-    }
-
-    /// GPU 路径的回读包围盒：完全在内 / 部分越界 / 完全在外三种情形。
-    ///
-    /// 这块算错的表现很隐蔽——指针会「少一截」，或者贴边时整块不画，而画面其余
-    /// 部分完全正常，很难联想到是包围盒而不是合成公式的问题。
-    #[test]
-    fn overlay_rect_clips_to_frame() {
-        let shape = color_shape(10, 8, &[[0, 0, 0, 255]; 80]);
-
-        // 完全在画面内
-        let inside = PointerState {
-            visible: true,
-            x: 20,
-            y: 30,
-        };
-        assert_eq!(
-            overlay_rect(inside, &shape, 100, 100),
-            Some((20, 30, 10, 8))
-        );
-
-        // 左上越界：起点夹到 0，尺寸相应缩小
-        let top_left = PointerState {
-            visible: true,
-            x: -4,
-            y: -3,
-        };
-        assert_eq!(overlay_rect(top_left, &shape, 100, 100), Some((0, 0, 6, 5)));
-
-        // 右下越界
-        let bottom_right = PointerState {
-            visible: true,
-            x: 95,
-            y: 96,
-        };
-        assert_eq!(
-            overlay_rect(bottom_right, &shape, 100, 100),
-            Some((95, 96, 5, 4))
-        );
-
-        // 完全在外
-        let outside = PointerState {
-            visible: true,
-            x: 200,
-            y: 0,
-        };
-        assert_eq!(overlay_rect(outside, &shape, 100, 100), None);
-        let outside_neg = PointerState {
-            visible: true,
-            x: -50,
-            y: 10,
-        };
-        assert_eq!(overlay_rect(outside_neg, &shape, 100, 100), None);
     }
 }

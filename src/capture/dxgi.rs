@@ -8,15 +8,18 @@
 //! 设备丢失（设计文档 4.3）：调用方检测到 `AccessLost` / `DeviceRemoved` 后进入重建循环
 //! （sleep 500ms 重试 `duplicate_output`，最多 10 次），本模块提供 [`DxgiCapture::rebuild`]。
 //!
-//! ## 指针通道
+//! ## 指针与特效通道
 //!
 //! 桌面复制交付的桌面图像里**不含鼠标指针**，指针走独立旁路
-//! （`PointerPosition` + `GetFramePointerShape`）。本模块负责维护这份状态并
-//! 在 CPU 路径直接合成；GPU 路径则把 [`PointerFrame`] 交给调用方，由它在显存内合成
+//! （`PointerPosition` + `GetFramePointerShape`）。本模块负责维护这份状态，
+//! 连同「移动轨迹 / 点击波纹」这两个动态特效一起，产出每帧要叠加的内容
+//! （[`OverlayPlan`]）：CPU 路径直接画在整帧上，GPU 路径交给调用方在显存内合成
 //! （见 [`crate::encode::mf_sink`]）。
 //!
-//! 这里最容易搞错的两件事，都在 [`super::cursor`] 的模块注释里展开：
-//! **位置是左上角而非热点**，以及**不是每帧都带指针更新**（必须持久化上一状态）。
+//! 这里最容易搞错的几件事，都在 [`super::cursor`] 与 [`super::overlay`] 的模块注释里
+//! 展开：**位置是左上角而非热点**、**不是每帧都带指针更新**（必须持久化上一状态）、
+//! 以及**特效是时间驱动的动画**——它需要打破本模块「什么都没变就返回 `Ok(None)`」
+//! 的快捷路径（见 [`DxgiCapture::overlay_animating`]）。
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -42,7 +45,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{Error as WinError, Interface, Result as WinResult};
 
-use crate::capture::cursor::{CursorShape, PointerFrame, PointerState};
+use crate::capture::cursor::{Canvas, CursorShape, PointerState};
+use crate::capture::overlay::{CursorOverlay, OverlayConfig, OverlayPlan};
 
 /// 采集选项。
 ///
@@ -53,14 +57,28 @@ use crate::capture::cursor::{CursorShape, PointerFrame, PointerState};
 pub struct CaptureOptions {
     /// 是否把鼠标指针合成进画面（对应 ABI 的 `capture_cursor`）。
     ///
-    /// 默认 `false`：合成指针要额外维护一份「纯桌面」副本并每帧回读光标包围盒，
+    /// 默认 `false`：合成指针要额外维护一份「纯桌面」副本并每帧回读叠加区域，
     /// 不该在用户没要求时默默付出这份开销。
     pub capture_cursor: bool,
+    /// 指针之上的动态特效（移动轨迹 / 点击波纹）。未开 `capture_cursor` 时无意义。
+    pub overlay: OverlayConfig,
 }
 
 impl CaptureOptions {
     pub fn with_cursor(capture_cursor: bool) -> Self {
-        Self { capture_cursor }
+        Self {
+            capture_cursor,
+            overlay: OverlayConfig::default(),
+        }
+    }
+
+    /// 追加特效开关（对应 ABI 的 `cursor_click_effect` / `cursor_trail_ms`）。
+    pub fn with_effects(mut self, click_effect: bool, trail_ms: u32) -> Self {
+        self.overlay = OverlayConfig {
+            click_effect,
+            trail_ms,
+        };
+        self
     }
 }
 
@@ -68,11 +86,12 @@ impl CaptureOptions {
 ///
 /// `desktop_updated == false` 表示本次 `AcquireNextFrame` 只带来了指针变化
 /// （`AccumulatedFrames == 0`）：显存里的桌面图像没变，下游若自带上一帧副本就不必重拷。
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct FrameMeta<'a> {
     pub desktop_updated: bool,
-    /// `None` 表示没有开启指针合成
-    pub pointer: Option<PointerFrame<'a>>,
+    /// `None` 表示没有开启指针合成。`Some` 时即使 `is_empty()`（这一帧什么都没得画）
+    /// 也代表「下游要用那份纯桌面副本来派生画面」，因为清掉上一帧的指针同样需要它。
+    pub overlay: Option<OverlayPlan<'a>>,
 }
 
 /// 一帧捕获结果：CPU 侧 BGRA 数据（已裁剪到 region）。
@@ -129,6 +148,10 @@ pub struct DxgiCapture {
     pointer: PointerState,
     /// 最近一次拿到的形状。形状变化很稀疏（换光标时才变），每帧复用。
     shape: Option<CursorShape>,
+    /// 指针之上的动态特效状态机（轨迹采样、点击上升沿检测）。
+    ///
+    /// 始终存在：配置没开时它的 `observe`/`plan` 都是空操作，省掉一层 `Option` 判断。
+    overlay: CursorOverlay,
     /// 桌面像素缓存（仅 CPU 路径使用）。
     ///
     /// 用途有二：① 指针移动而桌面不变时，不必重新从显存搬整帧，直接在这份缓存上
@@ -298,6 +321,7 @@ impl DxgiCapture {
             capture_cursor: options.capture_cursor,
             pointer: PointerState::default(),
             shape: None,
+            overlay: CursorOverlay::new(options.overlay),
             desktop_bgra: None,
             force_desktop_copy: true,
         })
@@ -336,6 +360,9 @@ impl DxgiCapture {
         self.desktop_bgra = None;
         self.force_desktop_copy = true;
         self.shape = None;
+        // 特效状态也一并丢弃：断开期间可能过了很久，旧轨迹/旧波纹的时间戳
+        // 相对新会话已经是「很久以前」，留着只会得到一堆立即过期的项。
+        self.overlay = CursorOverlay::new(self.overlay.config());
         Ok(())
     }
 
@@ -347,6 +374,77 @@ impl DxgiCapture {
     /// 当前形状尺寸，`None` 表示还没收到过任何形状。
     pub fn cursor_shape_size(&self) -> Option<(u32, u32)> {
         self.shape.as_ref().map(|s| (s.width(), s.height()))
+    }
+
+    /// 叠加层此刻是否还有动画在进行（波纹扩散 / 残影淡出）。
+    ///
+    /// 采集循环必须用它做两件事：
+    /// 1. 打破「桌面没变、指针也没动就返回 `Ok(None)`」的快捷路径；
+    /// 2. 动画期间缩短 `AcquireNextFrame` 的超时，否则静止画面上每个动画帧都要
+    ///    先白等一次超时，300 ms 的波纹会掉成个位数帧。
+    pub fn overlay_animating(&self) -> bool {
+        self.capture_cursor && self.overlay.is_animating(qpc_micros())
+    }
+
+    /// 现在这一刻要叠加的内容。`None` 表示没开指针合成。
+    ///
+    /// 给「桌面没变、但特效还在动」的帧用：调用方拿它去重画一帧，不需要新的显存帧。
+    pub fn overlay_plan_now(&self) -> Option<OverlayPlan<'_>> {
+        if !self.capture_cursor {
+            return None;
+        }
+        Some(self.overlay.plan(
+            self.shape.as_ref(),
+            self.pointer,
+            qpc_micros(),
+            self.width,
+            self.height,
+        ))
+    }
+
+    /// 用缓存的桌面像素重新合成一帧（CPU 路径的「动画帧」）。
+    ///
+    /// 返回 `None` 表示还没拿到过桌面内容，调用方应退回「复用上一帧」。
+    /// 没有任何可画内容时返回的是缓存 `Arc` 的克隆（零拷贝），不会白拷 8 MB。
+    pub fn recompose_overlay(&mut self, qpc: u64) -> Option<CapturedFrame> {
+        if !self.capture_cursor {
+            return None;
+        }
+        let desktop = self.desktop_bgra.as_ref()?;
+        let w = self.width;
+        let h = self.height;
+        let stride = (w * 4) as usize;
+
+        let plan = self
+            .overlay
+            .plan(self.shape.as_ref(), self.pointer, qpc_micros(), w, h);
+        let bgra: Arc<[u8]> = if plan.is_empty() {
+            Arc::clone(desktop)
+        } else {
+            let mut buf = desktop.to_vec();
+            plan.draw_into(&mut Canvas::new(&mut buf, stride, w, h), (0, 0));
+            buf.into()
+        };
+
+        Some(CapturedFrame {
+            bgra,
+            stride: w * 4,
+            width: w,
+            height: h,
+            qpc,
+        })
+    }
+
+    /// 观察一次叠加层（采样轨迹、检测点击上升沿）。
+    ///
+    /// **每个采集时机都要调**，包括「等不到新帧」的时候——否则点在静止画面上的
+    /// 那一下永远不会被记录，波纹也就永远不会出现。
+    fn observe_overlay(&mut self, now_us: u64) {
+        if !self.capture_cursor {
+            return;
+        }
+        let hotspot = self.shape.as_ref().map(|s| s.hotspot()).unwrap_or((0, 0));
+        self.overlay.observe(self.pointer, hotspot, now_us);
     }
 
     /// 刷新指针位置与形状，返回「本帧是否有可见变化」。
@@ -526,6 +624,7 @@ impl DxgiCapture {
         timeout_ms: u32,
         qpc_now: u64,
     ) -> WinResult<Option<CapturedFrame>> {
+        let now_us = qpc_micros();
         let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = unsafe { std::mem::zeroed() };
         let mut resource: Option<windows::Win32::Graphics::Dxgi::IDXGIResource> = None;
 
@@ -535,6 +634,9 @@ impl DxgiCapture {
         };
         if let Err(e) = hr {
             if e.code() == DXGI_ERROR_WAIT_TIMEOUT {
+                // 等不到新帧也要采一次样：点击可能正发生在完全静止的画面上，
+                // 而点击本身不会让 DXGI 交付帧。
+                self.observe_overlay(now_us);
                 return Ok(None);
             }
             return Err(e);
@@ -550,20 +652,14 @@ impl DxgiCapture {
         };
         let frame_texture: ID3D11Texture2D = resource.cast()?;
 
-        if self.discard_next_frame {
-            // 见字段注释：建立/重建 duplication 后的第一帧是未初始化图像。
-            self.discard_next_frame = false;
-            unsafe {
-                let _ = self.duplication.ReleaseFrame();
-            }
-            return Ok(None);
-        }
-
         // 指针状态必须在 ReleaseFrame **之前**刷新：`GetFramePointerShape` 要求
         // 调用方仍持有帧，否则返回 DXGI_ERROR_INVALID_CALL。
         let pointer_changed = self.update_pointer(&frame_info);
+        self.observe_overlay(now_us);
         // 有无新的桌面像素。`force_desktop_copy` 覆盖「首帧 / 重建后」两种情况。
         let desktop_updated = frame_info.AccumulatedFrames > 0 || self.force_desktop_copy;
+        // 特效还在动也得出帧：波纹扩散与残影淡出不依赖任何外部变化。
+        let animating = self.overlay.is_animating(now_us);
 
         if self.discard_next_frame {
             // 见字段注释：建立/重建 duplication 后的第一帧是未初始化图像。
@@ -575,9 +671,9 @@ impl DxgiCapture {
             return Ok(None);
         }
 
-        // 桌面没变、指针也没动 → 与 WAIT_TIMEOUT 等价，让上层重发上一帧副本。
+        // 桌面没变、指针也没动、特效也不动 → 与 WAIT_TIMEOUT 等价，让上层重发上一帧。
         // 这条分支同时省掉一次整帧 memcpy（静止画面下这是常态）。
-        if !desktop_updated && !pointer_changed {
+        if !desktop_updated && !pointer_changed && !animating {
             unsafe {
                 let _ = self.duplication.ReleaseFrame();
             }
@@ -611,23 +707,20 @@ impl DxgiCapture {
         let h = self.height;
         let stride = (w * 4) as usize;
 
-        // 指针合成。只有真的会画出像素时才复制整帧——1080p 一帧就是 8 MB，
+        // 叠加合成。只有真的会画出像素时才复制整帧——1080p 一帧就是 8 MB，
         // 静止画面上每帧复制一遍的代价不可忽略。
-        let composed: Option<Arc<[u8]>> = if self.capture_cursor && self.pointer.visible {
-            match self.shape.as_ref() {
-                Some(shape) => {
-                    let mut buf = desktop.to_vec();
-                    let touched =
-                        shape.blend_into(&mut buf, stride, w, h, self.pointer.x, self.pointer.y);
-                    if touched > 0 { Some(buf.into()) } else { None }
-                }
-                None => None,
-            }
-        } else {
+        let plan = self
+            .overlay
+            .plan(self.shape.as_ref(), self.pointer, now_us, w, h);
+        let composed: Option<Arc<[u8]>> = if plan.is_empty() {
             None
+        } else {
+            let mut buf = desktop.to_vec();
+            plan.draw_into(&mut Canvas::new(&mut buf, stride, w, h), (0, 0));
+            Some(buf.into())
         };
 
-        // 没合成（未开指针 / 光标不在区域内）时直接复用缓存：零拷贝。
+        // 没合成（未开指针 / 光标不在区域内 / 特效已结束）时直接复用缓存：零拷贝。
         let bgra = composed.unwrap_or_else(|| Arc::clone(desktop));
 
         unsafe {
@@ -648,12 +741,13 @@ impl DxgiCapture {
     /// 随后自动释放帧。
     ///
     /// 闭包额外拿到 [`FrameMeta`]：桌面是否真的更新了（`desktop_updated`），
-    /// 以及指针的当前状态（`pointer`，未开启指针合成时为 `None`）。
+    /// 以及这一刻要叠加的内容（`overlay`，未开启指针合成时为 `None`）。
     /// 前者让下游能跳过「只有指针动」时的整帧重拷。
     pub fn acquire_texture<F, R>(&mut self, timeout_ms: u32, f: F) -> WinResult<Option<R>>
     where
         F: FnOnce(&ID3D11Texture2D, FrameMeta<'_>) -> WinResult<R>,
     {
+        let now_us = qpc_micros();
         let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = unsafe { std::mem::zeroed() };
         let mut resource: Option<windows::Win32::Graphics::Dxgi::IDXGIResource> = None;
 
@@ -663,6 +757,7 @@ impl DxgiCapture {
         };
         if let Err(e) = hr {
             if e.code() == DXGI_ERROR_WAIT_TIMEOUT {
+                self.observe_overlay(now_us);
                 return Ok(None);
             }
             return Err(e);
@@ -678,7 +773,9 @@ impl DxgiCapture {
         let frame_texture: ID3D11Texture2D = resource.cast()?;
 
         let pointer_changed = self.update_pointer(&frame_info);
+        self.observe_overlay(now_us);
         let desktop_updated = frame_info.AccumulatedFrames > 0 || self.force_desktop_copy;
+        let animating = self.overlay.is_animating(now_us);
 
         if self.discard_next_frame {
             self.discard_next_frame = false;
@@ -686,18 +783,20 @@ impl DxgiCapture {
             return Ok(None);
         }
 
-        if !desktop_updated && !pointer_changed {
+        if !desktop_updated && !pointer_changed && !animating {
             let _ = unsafe { self.duplication.ReleaseFrame() };
             return Ok(None);
         }
 
+        let w = self.width;
+        let h = self.height;
         let meta = FrameMeta {
             desktop_updated,
-            pointer: if self.capture_cursor {
-                Some(PointerFrame {
-                    state: self.pointer,
-                    shape: self.shape.as_ref(),
-                })
+            overlay: if self.capture_cursor {
+                Some(
+                    self.overlay
+                        .plan(self.shape.as_ref(), self.pointer, now_us, w, h),
+                )
             } else {
                 None
             },
@@ -787,6 +886,15 @@ pub fn qpc_frequency() -> u64 {
         let _ = windows::Win32::System::Performance::QueryPerformanceFrequency(&mut freq);
     }
     freq.max(1) as u64
+}
+
+/// 当前单调时间（微秒），供特效动画计时用。
+///
+/// 用 `u128` 中转再落回 `u64`：tick 数乘 1e6 的量级很容易超过 `u64`（QPC 频率常见
+/// 10 MHz，开机一小时后 tick 数就有 3.6e10，乘完是 3.6e16），但 `u128` 绝不会溢出。
+#[inline]
+pub fn qpc_micros() -> u64 {
+    (qpc_now() as u128 * 1_000_000 / qpc_frequency() as u128) as u64
 }
 
 /// 高精度可等待定时器句柄缓存（`isize` 中转，`HANDLE` 不实现 Send/Sync）。

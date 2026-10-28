@@ -53,6 +53,8 @@ fn config_with_audio(path: &str, encoder: EncoderPreference) -> RecordingConfig 
         encoder,
         bitrate_kbps: 3000,
         capture_cursor: false,
+        cursor_click_effect: false,
+        cursor_trail_ms: 0,
         output_path: path.to_string(),
         audio_source: AudioSourceType::System,
         audio_device_id: None,

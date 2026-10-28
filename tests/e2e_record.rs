@@ -35,6 +35,8 @@ fn recording_config(path: &str, encoder: EncoderPreference) -> RecordingConfig {
         encoder,
         bitrate_kbps: 3000,
         capture_cursor: false,
+        cursor_click_effect: false,
+        cursor_trail_ms: 0,
         output_path: path.to_string(),
         audio_source: AudioSourceType::None,
         audio_device_id: None,
@@ -247,6 +249,81 @@ fn e2e_gpu_recording_with_cursor() {
     assert!(
         (expected - 0.4..=expected + 0.6).contains(&seconds),
         "[gpu+cursor] 时长应约 {expected:.1}s，实际 {seconds:.2}s"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 开启「移动轨迹 + 点击波纹」后照样能录出正常文件，且帧率节奏不变。
+///
+/// 这条用例真正压的是**动画驱动出帧**那条新分支：鼠标每次挪几像素，`SetCursorPos`
+/// 之间有 30 ms 间隔，DXGI 常常不交付新帧（`AccumulateFrames == 0`），而轨迹残影
+/// 还活着——采集层必须靠 `overlay_animating()` 打破「静止就直接返回 None」，
+/// 再从纯桌面副本重绘。这条分支一旦写错，现象是「拖尾卡住不动」或「帧率掉一半」，
+/// 都只有真跑起来才看得见。
+///
+/// 点击波纹的**触发**没在这里验证：那需要在用户桌面上真的按一下鼠标，副作用
+/// （点到某个窗口、清掉文件选择）不是测试该做的事。触发逻辑由 `overlay` 的
+/// 上升沿单测覆盖，落笔像素由 GPU 合成单测覆盖。
+#[test]
+#[ignore = "需要 Media Foundation；用 --ignored 手动运行"]
+fn e2e_gpu_recording_with_cursor_effects() {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+
+    let mut origin = POINT::default();
+    // Safety: 本地变量地址，调用期间有效。
+    let saved = unsafe { GetCursorPos(&mut origin) }.is_ok();
+
+    let dir = std::env::temp_dir().join("murecorder_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("e2e_gpu_cursor_effects.mp4");
+    let _ = std::fs::remove_file(&path);
+    let path_str = path.to_string_lossy().to_string();
+
+    let mut cfg = recording_config(&path_str, EncoderPreference::Auto);
+    cfg.capture_cursor = true;
+    cfg.cursor_click_effect = true;
+    cfg.cursor_trail_ms = 240;
+
+    let mut rec = Recorder::created(cfg).expect("create 失败");
+    rec.start().expect("start 失败");
+
+    // 沿一条斜线小步移动：每步只挪几个像素，保证残影会重叠（并集不大，
+    // 不会触发面积上限而裁掉轨迹）。
+    let steps = (DURATION_MS / 30) as i32;
+    for i in 0..steps {
+        let x = REGION.0 + 20 + i * 4;
+        let y = REGION.1 + 20 + i * 3;
+        unsafe {
+            let _ = SetCursorPos(x, y);
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    rec.stop().expect("stop 失败（封装可能失败）");
+
+    if saved {
+        unsafe {
+            let _ = SetCursorPos(origin.x, origin.y);
+        }
+    }
+
+    let file_size = std::fs::metadata(&path).expect("产物文件不存在").len();
+    let (frames, seconds) = inspect_with_mf(&path_str);
+    let snap = rec.stats_snapshot();
+    println!(
+        "[gpu+cursor+fx] {file_size} B, {frames} 帧, 时长 {seconds:.2}s, \
+         captured={} encoded={} dropped={}",
+        snap.frames_captured, snap.frames_encoded, snap.frames_dropped
+    );
+
+    assert!(frames > 30, "[gpu+cursor+fx] 帧数过少: {frames}");
+    let expected = DURATION_MS as f64 / 1000.0;
+    assert!(
+        (expected - 0.4..=expected + 0.6).contains(&seconds),
+        "[gpu+cursor+fx] 时长应约 {expected:.1}s，实际 {seconds:.2}s —— \
+         动画帧若没进编码器，时间轴会明显偏短"
     );
 
     let _ = std::fs::remove_file(&path);

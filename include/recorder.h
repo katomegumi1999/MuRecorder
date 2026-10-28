@@ -27,8 +27,12 @@
  *   v2 —— RecorderConfig 尾部追加 audio_bitrate_kbps。
  *         旧宿主（编进 v1 的结构体）会被明确拒绝（REC_ERR_INVALID），
  *         不会越界读，也不会静默拿到错码率。宿主升级只需把 AbiVersion 改成 2。
+ *   v3 —— RecorderConfig 尾部追加 cursor_click_effect / cursor_trail_ms
+ *         （鼠标点击波纹与移动轨迹拖尾，两者都要烧进画面）。
+ *         默认值均为 0（关闭），所以升级后行为与 v2 完全一致；但**必须**把
+ *         AbiVersion 改成 3，否则 v2 宿主会被拒绝（这是刻意的，见约束 5）。
  */
-#define RECORDER_ABI_VERSION 2
+#define RECORDER_ABI_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,6 +71,10 @@ typedef struct {
     uint64_t audio_window_hwnd;  /* AUDIO_WINDOW 时使用 */
     uint32_t audio_process_id;   /* AUDIO_WINDOW 时使用（0 表示仅按 HWND 解析） */
     uint32_t audio_bitrate_kbps; /* 音频码率（kbps），0 表示默认（320 kbps），支持 96/128/160/192/256/320 */
+
+    /* ---- v3 追加 ---- */
+    uint32_t cursor_click_effect; /* 0/1：点击处画扩散圆环（约 350 ms 淡出）。需 capture_cursor=1 */
+    uint32_t cursor_trail_ms;     /* 移动轨迹拖尾时长 ms：0=关闭，否则 40~3000。需 capture_cursor=1 */
 } RecorderConfig;
 
 typedef struct {

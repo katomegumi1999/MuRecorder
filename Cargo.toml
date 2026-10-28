@@ -45,6 +45,9 @@ windows = { version = "0.62", features = [
     # GetWindowThreadProcessId：AUDIO_WINDOW 音源只给了 HWND 时用来反查 PID
     # （进程环回 API 要的是 PID，不是窗口句柄）。
     "Win32_UI_WindowsAndMessaging",
+    # GetAsyncKeyState：鼠标点击特效靠每帧轮询按键状态检测「按下」这个上升沿，
+    # 不用全局钩子（钩子要消息循环线程、是进程外注入、超时会被系统摘掉）。
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 # `#[implement(...)]` 宏展开后用的是 `::windows_core::` **绝对路径**，所以除了
 # `windows` 之外必须把 `windows-core` 也作为直接依赖引入（版本要与 windows 一致，

@@ -71,7 +71,7 @@ public enum EncoderPreference : uint
 [StructLayout(LayoutKind.Sequential)]
 public struct RecorderConfig
 {
-    public uint AbiVersion;          // 固定填 2（RECORDER_ABI_VERSION）；填 1 等旧值会被明确拒绝
+    public uint AbiVersion;          // 固定填 3（RECORDER_ABI_VERSION）；填 1/2 等旧值会被明确拒绝
     public int RegionX;              // 虚拟屏幕物理像素坐标 X
     public int RegionY;              // 虚拟屏幕物理像素坐标 Y
     public uint RegionW;             // 录制区域物理像素宽度（建议为偶数）
@@ -79,7 +79,7 @@ public struct RecorderConfig
     public uint Fps;                 // 目标帧率（1 ~ 120，推荐 30 或 60）
     public uint Encoder;             // 见 EncoderPreference
     public uint BitrateKbps;         // 视频目标码率（kbps，0 则引擎自动计算默认值）
-    public uint CaptureCursor;       // 是否捕获鼠标（0=否，1=是）
+    public uint CaptureCursor;       // 是否把鼠标指针烧进画面（0=否，1=是）
     
     [MarshalAs(UnmanagedType.LPUTF8Str)]
     public string OutputPath;        // 绝对路径，UTF-8，必须有写入权限且所在文件夹存在
@@ -92,6 +92,10 @@ public struct RecorderConfig
     public ulong AudioWindowHwnd;    // 当 AudioSourceType == Window 时传目标窗口句柄 (HWND)
     public uint AudioProcessId;      // 当 AudioSourceType == Window 时传 PID（传 0 则自动按 HWND 查找）
     public uint AudioBitrateKbps;    // 音频码率（kbps，传 0 默认 320；支持 96, 128, 160, 192, 256, 320）
+
+    // ---- v3 追加：以下两个字段必须排在最后，顺序不可调整 ----
+    public uint CursorClickEffect;   // 0=关，1=点击处画扩散圆环（约 350 ms 淡出）
+    public uint CursorTrailMs;       // 移动轨迹拖尾时长 ms：0=关，否则 40~3000（建议 120~400）
 }
 
 /// <summary>
@@ -118,7 +122,7 @@ public static partial class MuRecorderNative
 {
     private const string DllName = "murecorder_core";
 
-    public const uint RecorderAbiVersion = 2;
+    public const uint RecorderAbiVersion = 3;
 
     [LibraryImport(DllName, EntryPoint = "recorder_create")]
     public static partial int Create(in RecorderConfig config, out IntPtr handle);
@@ -317,6 +321,9 @@ var config = new RecorderConfig
     Encoder = (uint)EncoderPreference.Auto, // 优先 GPU HEVC / H.264
     BitrateKbps = 8000,                    // 8 Mbps 视频码率
     CaptureCursor = 1,
+    // 鼠标特效（都要 CaptureCursor = 1，否则会被拒绝）
+    CursorClickEffect = 1,               // 点击处扩散圆环
+    CursorTrailMs = 240,                 // 240 ms 移动拖尾；填 0 关闭
     OutputPath = @"D:\Recordings\gameplay.mp4",
     
     // 关键：开启系统声音录制

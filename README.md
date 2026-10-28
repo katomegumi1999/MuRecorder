@@ -48,6 +48,7 @@ Most "record the screen from Rust" tutorials stop at `AcquireNextFrame`. The har
 | Lock-free frame counters, 200 ms sampled snapshot | ✅ |
 | Audio recording (WASAPI loopback default / specific device, process tree loopback, AAC-LC 320k stereo) | ✅ |
 | Cursor compositing (monochrome / 32bpp / masked-colour shapes, exact placement, no ghost trail) | ✅ |
+| Cursor effects burned into the pixels: click ripple (350 ms expand-and-fade ring) + movement trail (40–3000 ms fading ghosts), both switchable over the C ABI | ✅ |
 | HDR / wide-gamut capture | ❌ SDR only |
 
 ## Requirements
@@ -67,6 +68,7 @@ Drop `murecorder_core.dll` next to your executable.
 - C header: [`include/recorder.h`](include/recorder.h)
 - Full C# integration guide & examples: [`docs/csharp-guide.md`](docs/csharp-guide.md)
 - Cursor compositing design notes: [`docs/cursor-design.md`](docs/cursor-design.md)
+- Cursor effects (click ripple / movement trail) design notes: [`docs/cursor-effects.md`](docs/cursor-effects.md)
 
 Minimal C# consumer (abridged — see the header for the full contract):
 
@@ -76,7 +78,7 @@ using System.Runtime.InteropServices;
 [StructLayout(LayoutKind.Sequential)]
 struct RecorderConfig
 {
-    public uint AbiVersion;                     // must be 1
+    public uint AbiVersion;                     // must be 3
     public int RegionX, RegionY;                // physical pixels, virtual-desktop coords
     public uint RegionW, RegionH;
     public uint Fps;
@@ -89,6 +91,8 @@ struct RecorderConfig
     public ulong AudioWindowHwnd;
     public uint AudioProcessId;
     public uint AudioBitrateKbps;               // 0 = default (320k), supports 96/128/160/192/256/320
+    public uint CursorClickEffect;               // 0/1, needs CaptureCursor = 1
+    public uint CursorTrailMs;                   // 0 = off, else 40..3000, needs CaptureCursor = 1
 }
 
 static partial class Native
@@ -270,11 +274,11 @@ cargo test --lib -- --ignored --nocapture   # real SinkWriter: every codec × co
 
 `tests/e2e_record.rs` records 2 seconds of the actual screen and reads the file back with Media Foundation's own MP4 parser, checking frame count, dimensions and timeline length. It is `#[ignore]`d because it needs a desktop, but it is the only test that proves the container is acceptable to a *real* demuxer. Several more cases cover the GPU writer: `e2e_gpu_recording_finalizes_to_plain_mp4` asserts the container collapses to `ftyp`/`mdat`/`moov` and that Media Foundation accepts the rebuilt index; `e2e_slice_gpu_recording_while_running` cuts a range **while the file is still being written** and then checks both the slice and the untouched recording (AV1 is the only exception: it does refuse, and the assertion pins down that the reason is stated clearly, so the case never silently skips); `e2e_hevc_records_when_explicitly_requested` proves HEVC goes through the custom sink — the file already contains `moof` with a `mvex`-bearing `moov` **while recording**, and after stop the `moov` no longer has `mvex` while `hvc1` really is present, rather than a silent H.264 downgrade. `e2e_slice_from_recording_is_playable` does the CPU-path equivalent.
 `tests/e2e_audio.rs` covers the audio side with the same philosophy: `e2e_audio_with_software_encoder` records real system audio and then hands the track to Media Foundation's **AAC decoder**, so a wrong `esds`/`AudioSpecificConfig` fails there instead of in the player; `e2e_audio_timeline_matches_video_when_desktop_is_quiet` asserts the two tracks stay within 250 ms of each other (on a silent desktop the only way that holds is the wall-clock-driven silence padding working); `e2e_audio_survives_slicing` cuts a range mid-recording and requires the slice to carry **both** tracks with the audio aligned to the video keyframe on the way in and clamped to the video's real end on the way out.
-`tests/e2e_cursor.rs` moves the real pointer and asserts that the pixel block at the old position and at the new position both change between two frames — the only way to prove the pointer actually reaches the encoded pixels. Its assertions deliberately use the *observed* pointer position rather than the requested one, because on a live machine the two differ (the mouse can be taken over mid-test). Separately, `encode::mf_sink::tests::gpu_cursor_is_composited_and_leaves_no_trail` drives the GPU writer with a synthetic cursor and reads pixels back out of the texture that feeds the encoder, which pins down placement, the absence of a ghost trail when the cursor moves, and that an invisible pointer draws nothing.
+`tests/e2e_cursor.rs` moves the real pointer and asserts that the pixel block at the old position and at the new position both change between two frames — the only way to prove the pointer actually reaches the encoded pixels. Its assertions deliberately use the *observed* pointer position rather than the requested one, because on a live machine the two differ (the mouse can be taken over mid-test). Separately, `encode::mf_sink::tests::gpu_cursor_is_composited_and_leaves_no_trail` drives the GPU writer with a synthetic cursor and reads pixels back out of the texture that feeds the encoder, which pins down placement, the absence of a ghost trail when the cursor moves, that an invisible pointer draws nothing, and that an animation-only frame (ripple alive, desktop and pointer both still) is repainted from the clean desktop copy and then wiped clean. `e2e_gpu_recording_with_cursor_effects` turns both effects on for a real 2-second recording and requires the frame count and timeline length to stay unchanged — that is what proves the animation path actually reaches the encoder instead of stalling on the "nothing changed" shortcut. The click *trigger* is deliberately not exercised end-to-end: that would mean pressing a real mouse button on the user's desktop.
 
 ## Known limitations
 
-- The mouse cursor is composited **into the pixels**, not as an overlay track, so it is burned into the video and cannot be switched off afterwards. The GPU path only reads back the cursor's bounding box (typically 32×32) instead of the whole frame, so hardware encode stays zero-copy for the desktop. Two honest gaps: the one-shot GDI fallback that supplies the very first frame never contains a cursor (the shape is only obtainable while holding a DXGI frame), and fully hardware-overlay content (some exclusive-fullscreen games) is invisible to desktop duplication regardless of this setting.
+- The mouse cursor is composited **into the pixels**, not as an overlay track, so it is burned into the video and cannot be switched off afterwards. The GPU path only reads back the cursor's bounding box (typically 32×32) instead of the whole frame, so hardware encode stays zero-copy for the desktop. Two honest gaps: the one-shot GDI fallback that supplies the very first frame never contains a cursor (the shape is only obtainable while holding a DXGI frame), and fully hardware-overlay content (some exclusive-fullscreen games) is invisible to desktop duplication regardless of this setting. Click detection polls `GetAsyncKeyState` once per frame rather than installing a low-level hook (a hook needs a message-loop thread, is process-wide, and gets silently removed on timeout); a press-and-release shorter than one frame interval can therefore be missed, which human clicks (50–200 ms) never are. The movement trail is clipped to the bounding box of its sampling points, so very fast diagonal drags lose their oldest ghosts (they fade, they do not snap off).
 - **Audio is AAC-LC only**, 48 kHz / stereo, and the bitrate is limited to the six tiers in `audio_bitrate_kbps` (96/128/160/192/256/320 kbps). There is no resampling option: 48 kHz is the WASAPI mix-engine rate, so anything else would only add a conversion.
 - The audio track is decoded and checked end-to-end on every `cargo test --test e2e_audio -- --ignored` run, including a real Media Foundation AAC decode (a mismatched `esds`/ASC fails there rather than in the player).
 - HDR desktops are captured as SDR BGRA8 and will look flattened.

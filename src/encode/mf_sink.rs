@@ -7,7 +7,7 @@
 //! 4. 逐帧截取后在 GPU 内完成裁剪 (`CopySubresourceRegion`)，
 //!    调用 `MFCreateDXGISurfaceBuffer` 直接包装显存纹理句柄，通过 `IMFSinkWriter::WriteSample` 直送硬件编码器。
 //!
-//! ## 指针合成为什么是这样做的
+//! ## 指针与特效合成为什么是这样做的
 //!
 //! 桌面复制的桌面图像里没有鼠标指针，必须自己画（详见 [`crate::capture::cursor`]）。
 //! 合成点在**裁剪后的 BGRA 纹理**上、`BGRA→NV12` 之前，这样 H.264（ARGB32 输入）
@@ -16,14 +16,17 @@
 //! 三个关键决定：
 //!
 //! 1. **两份纹理。** `desktop_texture` 存「纯桌面」，`cropped_texture` 存
-//!    「桌面 + 指针」。没有前者的话，指针移动时新指针会画在旧指针上，
-//!    鼠标划过的轨迹会留下一串残影。
-//! 2. **只回读光标的包围盒，不整帧回读。** 整帧回读会让 4K 每帧多走 33 MB
-//!    PCIe（等于把零拷贝的收益全吐回去）。包围盒通常只有 32×32～64×64。
-//! 3. **像素逻辑复用 CPU 那一份**（[`crate::capture::CursorShape::blend_into`]），
-//!    不在 GPU 侧另写一套。单色光标的「反色」分支必须读到桌面像素才能算，用着色器
-//!    实现得再做一次全屏采样；而包围盒回读天然把桌面像素摆在手边。代价是每帧一次小
-//!    Map（约 0.1–0.3 ms），换来的是 CPU/GPU 两条路不可能出现像素分歧。
+//!    「桌面 + 指针 + 特效」。没有前者的话，指针移动时新指针会画在旧指针上，
+//!    鼠标划过的轨迹会留下一串擦不掉的残影；移动轨迹特效也正好需要「每一帧都从
+//!    干净的桌面重新叠」才谈得上残影按时间淡出。
+//! 2. **只回读叠加区域的包围盒，不整帧回读。** 整帧回读会让 4K 每帧多走 33 MB
+//!    PCIe（等于把零拷贝的收益全吐回去）。只有指针时包围盒通常 32×32～64×64；
+//!    带轨迹时上限由 [`crate::capture::overlay`] 控制。
+//! 3. **像素逻辑复用 CPU 那一份**（[`crate::capture::CursorShape::blend_into`] 与
+//!    [`crate::capture::overlay::OverlayPlan::draw_into`]），不在 GPU 侧另写一套。
+//!    单色光标的「反色」分支必须读到桌面像素才能算，用着色器实现得再做一次全屏采样；
+//!    而包围盒回读天然把桌面像素摆在手边。代价是每帧一次小 Map（约 0.1–0.3 ms），
+//!    换来的是 CPU/GPU 两条路不可能出现像素分歧。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,9 +72,8 @@ use windows::Win32::System::Com::{
 };
 use windows::core::{Error as WinError, Interface, PCWSTR, Result as WinResult};
 
-use crate::capture::PointerFrame;
-use crate::capture::cursor::overlay_rect;
 use crate::capture::dxgi::FrameMeta;
+use crate::capture::overlay::OverlayPlan;
 use crate::encode::sink_raw::RawMediaSink;
 use crate::mux::mp4::{Mp4Muxer, SampleDescription};
 use crate::mux::nal::{annexb_to_mp4_sample, build_avcc, build_hvcc, parse_parameter_sets};
@@ -839,16 +841,16 @@ impl GpuSinkWriter {
         self.drain_raw()
     }
 
-    /// 核心调用：在显存内完成子区域裁剪、（可选）指针合成，并直接包装送入 GPU 编码器。
+    /// 核心调用：在显存内完成子区域裁剪、（可选）指针与特效叠加，并直接包装送入 GPU 编码器。
     ///
     /// `pts_us` 必须是**真实采集时刻**（相对录制起点的 QPC 微秒）。
     /// 早期实现用 `frame_count × 帧间隔` 生成时间戳，一旦编码或写盘跟不上，
     /// 时间轴就按帧数压缩——60 秒的实录可能只播 20 秒，接入音频后必然音画不同步。
     ///
-    /// `meta.pointer` 为 `Some` 表示本次录制开启了指针合成（形状是否就绪另说）；
-    /// `meta.desktop_updated` 表示显存里的桌面图像本帧是否真的变了。后者为 false
-    /// 时只需把上次存下的纯桌面副本再摊一次，不必再截一次显存——「只有鼠标在动、
-    /// 画面别处完全静止」是很常见的情形。
+    /// `meta.overlay` 为 `Some` 表示本次录制开启了指针合成（形状是否就绪、有没有要
+    /// 画的东西另说）；`meta.desktop_updated` 表示显存里的桌面图像本帧是否真的变了。
+    /// 后者为 false 时只需把上次存下的纯桌面副本再摊一次，不必再截一次显存
+    /// ——「只有鼠标在动、画面别处完全静止」是很常见的情形。
     pub fn push_frame(
         &mut self,
         source_texture: &ID3D11Texture2D,
@@ -866,7 +868,7 @@ impl GpuSinkWriter {
             back: 1,
         };
 
-        match meta.pointer {
+        match meta.overlay {
             // 未开启指针合成：一条路走到底，不引入任何额外拷贝。
             None => unsafe {
                 self.context.CopySubresourceRegion(
@@ -880,8 +882,8 @@ impl GpuSinkWriter {
                     Some(&crop_box),
                 );
             },
-            // 开启指针合成：先维护「纯桌面」副本，再从它派生本帧画面。
-            Some(pointer) => {
+            // 开启叠加：先维护「纯桌面」副本，再从它派生本帧画面。
+            Some(plan) => {
                 self.ensure_desktop_texture()?;
                 if meta.desktop_updated || !self.desktop_valid {
                     let desktop = self.desktop_texture.as_ref().unwrap();
@@ -899,35 +901,55 @@ impl GpuSinkWriter {
                     }
                     self.desktop_valid = true;
                 }
-                let desktop = self.desktop_texture.as_ref().unwrap();
-                // 每帧都从干净底重来：这是「不留残影」的全部要点。
-                unsafe { self.context.CopyResource(&self.cropped_texture, desktop) };
-
-                // 形状与可见性都就绪才真正落笔。
-                if pointer.is_drawable() {
-                    self.composite_cursor(&pointer)?;
-                }
+                self.repaint_from_desktop(&plan)?;
             }
         }
 
         unsafe { self.write_current_buffer(pts_us) }
     }
 
-    /// 把指针画到 `cropped_texture` 上：只回读光标包围盒，合成后写回。
-    fn composite_cursor(&mut self, pointer: &PointerFrame<'_>) -> WinResult<()> {
-        let Some(shape) = pointer.shape else {
-            return Ok(());
-        };
-        // 包围盒与 CPU 路径共用同一份裁剪逻辑，避免两条路对「部分可见」判断不一致。
-        let Some((left, top, bw, bh)) = overlay_rect(pointer.state, shape, self.width, self.height)
-        else {
+    /// 桌面没变、但叠加层还在动（波纹扩散 / 残影淡出）时，重新派生一帧。
+    ///
+    /// 为什么必须单独有这条路：DXGI 只在画面或指针变化时交付帧，而特效是**时间**
+    /// 驱动的——用户点一下不动鼠标，桌面与指针都不变，靠 `push_frame` 永远等不到
+    /// 下一帧，波纹就冻在第一帧。调用方在采集超时后走这里，从 `desktop_texture`
+    /// 重画一遍即可，不需要新的显存帧。
+    ///
+    /// 返回 `false` 表示还没拿到过桌面内容（首帧未就绪），调用方应退回「复制上一帧」。
+    pub fn push_overlay_frame(&mut self, pts_us: u64, plan: &OverlayPlan<'_>) -> WinResult<bool> {
+        if !self.desktop_valid {
+            return Ok(false);
+        }
+        self.repaint_from_desktop(plan)?;
+        unsafe { self.write_current_buffer(pts_us) }.map(|()| true)
+    }
+
+    /// 从「纯桌面」副本重新派生 `cropped_texture` 并叠加 `plan`。
+    ///
+    /// **每帧都从干净底重来**，这是「不留残影」的全部要点：新指针不会画在旧指针上，
+    /// 残影的淡出也不会一层层叠死。
+    fn repaint_from_desktop(&mut self, plan: &OverlayPlan<'_>) -> WinResult<()> {
+        let desktop = self
+            .desktop_texture
+            .as_ref()
+            .ok_or_else(|| WinError::from_hresult(E_FAIL))?;
+        unsafe { self.context.CopyResource(&self.cropped_texture, desktop) };
+        if !plan.is_empty() {
+            self.composite_overlay(plan)?;
+        }
+        Ok(())
+    }
+
+    /// 把叠加层画到 `cropped_texture` 上：只回读包围盒，合成后写回。
+    fn composite_overlay(&mut self, plan: &OverlayPlan<'_>) -> WinResult<()> {
+        // 包围盒由叠加层自己算（所有元素的并集，已裁到画面内），CPU/GPU 两条路共用，
+        // 避免对「部分可见」的判断出现分歧。
+        let Some((left, top, bw, bh)) = plan.bounds(self.width, self.height) else {
             // 完全在画面外（常见：鼠标在另一块屏上）。
             return Ok(());
         };
-        // `PointerPosition` 给的是光标图像**左上角**（不是热点）。
-        let (sx, sy) = (pointer.state.x, pointer.state.y);
 
-        let staging = self.ensure_cursor_staging(bw, bh)?.clone();
+        let staging = self.ensure_overlay_staging(bw, bh)?.clone();
 
         // 1. 把目标包围盒读回 CPU 暂存纹理
         let read_back = D3D11_BOX {
@@ -957,18 +979,25 @@ impl GpuSinkWriter {
             self.context
                 .Map(&staging, 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped))?;
         }
-        {
+        let touched = {
             // 行距按 RowPitch 算，不要假设等于 bw*4（驱动常按 256 字节对齐）。
             let stride = mapped.RowPitch as usize;
             let len = stride * bh as usize;
             // Safety: staging 纹理是本函数刚建的、至少 bw×bh，Map 保证可读写整块。
             let buf = unsafe { std::slice::from_raw_parts_mut(mapped.pData as *mut u8, len) };
-            // 缓冲区原点对应画面 (left, top)，光标原点在 (sx, sy)，两者相减即可
-            // 让 blend_into 自己处理越界裁剪。
-            shape.blend_into(buf, stride, bw, bh, sx - left as i32, sy - top as i32);
-        }
+            // 缓冲区原点对应画面 (left, top)：把原点告诉叠加层，它自己处理越界裁剪。
+            plan.draw_into(
+                &mut crate::capture::Canvas::new(buf, stride, bw, bh),
+                (left as i32, top as i32),
+            )
+        };
         unsafe {
             self.context.Unmap(&staging, 0);
+        }
+
+        // 一个像素都没改（例如指针正好完全落在画面外）就别白搬一趟显存。
+        if touched == 0 {
+            return Ok(());
         }
 
         // 3. 写回同一位置
@@ -1005,10 +1034,11 @@ impl GpuSinkWriter {
         Ok(())
     }
 
-    /// 按需创建/扩容指针包围盒的暂存纹理（STAGING，CPU 可读写）。
+    /// 按需创建/扩容叠加区域回读用的暂存纹理（STAGING，CPU 可读写）。
     ///
-    /// 只在光标尺寸变大时重建；换光标很稀疏，这点分配可以忽略。
-    fn ensure_cursor_staging(&mut self, w: u32, h: u32) -> WinResult<&ID3D11Texture2D> {
+    /// 只在需要的区域变大时重建；单一光标时区域很小，带轨迹时上限由叠加层的面积
+    /// 上限兜住，所以不会出现「一路扩容到整帧」。
+    fn ensure_overlay_staging(&mut self, w: u32, h: u32) -> WinResult<&ID3D11Texture2D> {
         let fits = matches!(&self.cursor_staging, Some((_, ew, eh)) if *ew >= w && *eh >= h);
         if !fits {
             let tex = create_cursor_staging_texture(&self._device, w.max(1), h.max(1))?;
@@ -1452,13 +1482,15 @@ mod tests {
             crate::capture::CursorShape::parse(cursor_info.Type, &cursor_info, &cursor_data)
                 .expect("8×8 的 32bpp 光标应能解析");
 
-        let pointer_at = |x: i32, y: i32| crate::capture::PointerFrame {
-            state: crate::capture::PointerState {
-                visible: true,
-                x,
-                y,
-            },
-            shape: Some(&shape),
+        let cursor_plan = |x: i32, y: i32| {
+            crate::capture::overlay::OverlayPlan::cursor_only(
+                &shape,
+                crate::capture::PointerState {
+                    visible: true,
+                    x,
+                    y,
+                },
+            )
         };
 
         // 回读辅助：把 cropped_texture 拷到 staging 再取某个像素。
@@ -1509,7 +1541,7 @@ mod tests {
             0,
             FrameMeta {
                 desktop_updated: true,
-                pointer: Some(pointer_at(50, 60)),
+                overlay: Some(cursor_plan(50, 60)),
             },
         )
         .unwrap();
@@ -1529,7 +1561,7 @@ mod tests {
             33_333,
             FrameMeta {
                 desktop_updated: false,
-                pointer: Some(pointer_at(200, 100)),
+                overlay: Some(cursor_plan(200, 100)),
             },
         )
         .unwrap();
@@ -1542,14 +1574,14 @@ mod tests {
         );
 
         // 第 3 帧：指针不可见，整个画面都该是桌面色。
-        let invisible = crate::capture::PointerFrame {
-            state: crate::capture::PointerState {
+        let invisible = crate::capture::overlay::OverlayPlan::cursor_only(
+            &shape,
+            crate::capture::PointerState {
                 visible: false,
                 x: 200,
                 y: 100,
             },
-            shape: Some(&shape),
-        };
+        );
         sink.push_frame(
             &source,
             0,
@@ -1557,7 +1589,7 @@ mod tests {
             66_666,
             FrameMeta {
                 desktop_updated: false,
-                pointer: Some(invisible),
+                overlay: Some(invisible),
             },
         )
         .unwrap();
@@ -1567,9 +1599,47 @@ mod tests {
             "指针不可见时不应留下任何光标像素"
         );
 
+        // 第 4 步：动画帧。桌面与指针都不动，只有波纹在扩散——走 push_overlay_frame。
+        let mut overlay =
+            crate::capture::overlay::CursorOverlay::new(crate::capture::overlay::OverlayConfig {
+                click_effect: true,
+                trail_ms: 0,
+            });
+        let still = crate::capture::PointerState {
+            visible: false,
+            x: 0,
+            y: 0,
+        };
+        overlay.observe(still, (0, 0), 0);
+        overlay.push_ripple_for_test(100, 120, 0);
+        let ripple_plan = overlay.plan(Some(&shape), still, 50_000, W, H);
+        assert!(!ripple_plan.is_empty(), "波纹应当产生非空的叠加计划");
+        assert!(
+            sink.push_overlay_frame(100_000, &ripple_plan).unwrap(),
+            "桌面就绪后动画帧应当写成功"
+        );
+
+        // 圆环半径此刻约 16 px：沿 x 轴扫一遍，环上必须有像素被改写。
+        let ring_touched = (100..130).any(|x| read_pixel(&sink, x, 120) != DESKTOP);
+        assert!(ring_touched, "波纹圆环应当画进画布");
+
+        // 第 5 步：波纹过期后，同一块区域必须恢复成桌面色。
+        // 这一步验证的正是「每帧从纯桌面重来」——否则环会永久留在画布上。
+        let settled = crate::capture::overlay::OverlayPlan::cursor_only(
+            &shape,
+            crate::capture::PointerState {
+                visible: false,
+                x: 0,
+                y: 0,
+            },
+        );
+        sink.push_overlay_frame(200_000, &settled).unwrap();
+        let ring_gone = (100..130).all(|x| read_pixel(&sink, x, 120) == DESKTOP);
+        assert!(ring_gone, "波纹消失后必须抹干净，不能留下静态圆环");
+
         sink.finish().unwrap();
         let _ = std::fs::remove_file(&path);
-        println!("GPU 指针合成通过：位置正确、无残影、不可见时不绘制");
+        println!("GPU 叠加通过：位置正确、无残影、不可见时不绘制、动画帧可重绘并抹净");
     }
 
     /// 需要真实硬件编码器与 MF 运行时；无头 CI / 无 GPU 环境请用 `--ignored` 显式启用。

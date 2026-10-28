@@ -48,6 +48,12 @@ const DRAIN_POLL: Duration = Duration::from_millis(200);
 const FIRST_FRAME_TIMEOUT_MS: u32 = 500;
 /// 有帧后的采集超时：短超时让静止画面快速进入「重发副本」分支，维持帧率节奏。
 const FRAME_ACQUIRE_TIMEOUT_MS: u32 = 50;
+/// 有特效动画进行时的采集超时。
+///
+/// 50 ms 的超时在静止画面上等于「每个动画帧先白等 50 ms」，33 ms 的帧间隔会被拉成
+/// 83 ms —— 350 ms 的点击波纹只剩 4 帧，看起来像闪了一下。动画期间改成 2 ms，
+/// 让每一帧都按时重绘；代价只是这期间轮询密一点，且本来就该这么快。
+const ANIMATING_ACQUIRE_TIMEOUT_MS: u32 = 2;
 /// 首帧兜底：启动后这么久仍无帧（画面静止），改用 GDI 抓一张补首帧。
 const FIRST_FRAME_GDI_FALLBACK_MS: u64 = 300;
 /// 首帧兜底失败后的重试间隔。
@@ -277,7 +283,7 @@ impl Recorder {
             if let Ok(target) =
                 dxgi::find_target(cfg.region_x, cfg.region_y, cfg.region_w, cfg.region_h)
             {
-                let options = CaptureOptions::with_cursor(cfg.capture_cursor);
+                let options = capture_options(&cfg);
                 if let Ok(capture) = DxgiCapture::new(&target, options) {
                     let mut capture_opt = Some(capture);
 
@@ -863,6 +869,16 @@ fn audio_capture_loop<F>(
     }
 }
 
+/// 把校验后的配置翻译成采集选项。
+///
+/// 单独抽出来是因为两条采集路径（GPU 零拷贝 / CPU 软编）各建一次 `DxgiCapture`，
+/// 两处都必须带上同一组指针与特效开关——分开写很容易改了一处漏了另一处，
+/// 现象是「软编写出来的录像没有鼠标」这种很难第一眼归因的差异。
+fn capture_options(cfg: &RecordingConfig) -> CaptureOptions {
+    CaptureOptions::with_cursor(cfg.capture_cursor)
+        .with_effects(cfg.cursor_click_effect, cfg.cursor_trail_ms)
+}
+
 /// GPU 零拷贝直接录制线程（DXGI 纹理采集 + 显存裁剪 + MF 硬件编码 + MP4封装在单线程中闭环）。
 fn gpu_recorder_thread(
     cfg: RecordingConfig,
@@ -915,10 +931,13 @@ fn gpu_recorder_thread(
             next_frame_qpc = now + interval_ticks;
         }
 
-        let acquire_timeout_ms = if first_frame_seen {
-            FRAME_ACQUIRE_TIMEOUT_MS
-        } else {
+        let acquire_timeout_ms = if !first_frame_seen {
             FIRST_FRAME_TIMEOUT_MS
+        } else if capture.overlay_animating() {
+            // 特效还在动：别让超时把动画帧的节奏拖成一半。
+            ANIMATING_ACQUIRE_TIMEOUT_MS
+        } else {
+            FRAME_ACQUIRE_TIMEOUT_MS
         };
 
         // 真实采集时刻（QPC 微秒）。GPU 路径的样本时间戳必须用它，
@@ -973,8 +992,20 @@ fn gpu_recorder_thread(
                         }
                     }
                 } else {
-                    // 已有首帧，静止画面复用上一帧显存内容送入编码器维持 CFR
-                    if let Ok(true) = gpu_sink.push_duplicate_frame(pts_us) {
+                    // 已有首帧，静止画面复用上一帧显存内容送入编码器维持 CFR。
+                    //
+                    // 但特效还在动时不能直接复用：波纹扩散、残影淡出是**时间**驱动
+                    // 的动画，桌面与指针都不动也会变。DXGI 这时候不会再交付帧
+                    // （`AcquireNextFrame` 已超时），所以只能从存下的纯桌面副本重画一帧。
+                    let pushed = if capture.overlay_animating() {
+                        match capture.overlay_plan_now() {
+                            Some(plan) => gpu_sink.push_overlay_frame(pts_us, &plan),
+                            None => gpu_sink.push_duplicate_frame(pts_us),
+                        }
+                    } else {
+                        gpu_sink.push_duplicate_frame(pts_us)
+                    };
+                    if let Ok(true) = pushed {
                         env.stats.stats().on_frame_captured();
                         env.stats.stats().on_frame_encoded(approx_bytes_per_frame);
                     }
@@ -1056,7 +1087,7 @@ fn capture_thread(
         }
     };
 
-    let options = CaptureOptions::with_cursor(cfg.capture_cursor);
+    let options = capture_options(&cfg);
     let mut capture = match DxgiCapture::new(&target, options) {
         Ok(c) => c,
         Err(e) => {
@@ -1097,10 +1128,12 @@ fn capture_thread(
         }
 
         let qpc = dxgi::qpc_now();
-        let acquire_timeout_ms = if first_frame_seen {
-            FRAME_ACQUIRE_TIMEOUT_MS
-        } else {
+        let acquire_timeout_ms = if !first_frame_seen {
             FIRST_FRAME_TIMEOUT_MS
+        } else if capture.overlay_animating() {
+            ANIMATING_ACQUIRE_TIMEOUT_MS
+        } else {
+            FRAME_ACQUIRE_TIMEOUT_MS
         };
 
         // 本周期拿到的「新帧」（DXGI 交付或 GDI 兜底），None 表示本周期画面无变化。
@@ -1130,6 +1163,10 @@ fn capture_thread(
                             format!("静止画面首帧 GDI 兜底抓取失败: {e}"),
                         ),
                     }
+                } else if first_frame_seen && capture.overlay_animating() {
+                    // 特效还在动：从缓存的纯桌面重画一帧。这时 DXGI 给不出新帧，
+                    // 不重画的话波纹就停在它出现的那一帧。
+                    incoming = capture.recompose_overlay(qpc);
                 }
             }
             Err(e) => {
@@ -1382,6 +1419,8 @@ mod tests {
             encoder: crate::config::EncoderPreference::Auto,
             bitrate_kbps: 4000,
             capture_cursor: false,
+            cursor_click_effect: false,
+            cursor_trail_ms: 0,
             output_path: "x.mp4".into(),
             audio_source: audio,
             audio_device_id: None,

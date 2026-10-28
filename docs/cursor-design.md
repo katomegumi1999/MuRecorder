@@ -114,19 +114,19 @@ alpha 值，阈值法会让边缘出现硬锯齿。
 DxgiCapture ────────┤     桌面缓存 → to_vec() → blend_into() → CapturedFrame
 （指针状态机）       │
                     └─ GPU 路径：acquire_texture()
-                          FrameMeta{ desktop_updated, PointerFrame }
+                    FrameMeta{ desktop_updated, OverlayPlan }
                                     ↓
                           GpuSinkWriter::push_frame()
                              desktop_texture ─┐
                                               ├─ CopyResource → cropped_texture
-                             bbox 回读 ← ─────┘
-                             blend_into() → 写回 cropped_texture
+                             bounds 回读 ← ────┘
+                             draw_into() → 写回 cropped_texture
                                     ↓
                              BGRA→NV12 → 编码器
 ```
 
-关键决定：**像素逻辑只有一份**（`CursorShape::blend_into`），两条路共用。
-GPU 侧不另写着色器。
+关键决定：**像素逻辑只有一份**（`CursorShape::blend_into_alpha` 与
+`OverlayPlan::draw_into`），两条路共用。GPU 侧不另写着色器。
 
 ## 6. 为什么 GPU 路径不用着色器
 
@@ -164,7 +164,7 @@ GPU 侧不另写着色器。
 | 情形 | 处理 |
 |---|---|
 | 光标部分在区域外 | 包围盒与画面求交，`blend_into` 自己裁列/行 |
-| 光标完全在区域外（鼠标在另一块屏） | `overlay_rect` 返回 `None`，一个像素都不写，不触发重编码 |
+| 光标完全在区域外（鼠标在另一块屏） | `OverlayPlan::bounds` 返回 `None`，一个像素都不写，不触发重编码 |
 | 指针不可见（`Visible == FALSE`） | 不画。注意不能「保留上一次的指针」 |
 | 区域跨屏 / 坐标为负 | 与既有 `find_target` 的裁剪逻辑一致，指针坐标同步减去 `offset_x/offset_y` |
 | 设备丢失后重建 | `rebuild()` 清空 `desktop_bgra` / `shape`，并置 `force_desktop_copy` |
@@ -194,7 +194,8 @@ GPU 侧不另写着色器。
 - **音频**：无交互。指针帧和普通帧走同一条 PTS 规则。
 - **静态画面 CFR**：指针一帧一帧地动，帧就被一帧一帧地编码；画面和指针都静止时
   走重复帧路径，码率不会因为开了指针而暴涨。
-- **ABI**：`capture_cursor` 字段已存在，`ABI_VERSION` 保持 2。
+- **ABI**：`capture_cursor` 与 v3 的 `cursor_click_effect` / `cursor_trail_ms`（见
+  [`cursor-effects.md`](cursor-effects.md)）。
 
 ## 10. 性能
 
@@ -216,9 +217,9 @@ GPU 侧不另写着色器。
 | `masked_color_uses_alpha_as_mask` | masked-color 的两个分支 |
 | `clipping_keeps_in_frame_part_and_skips_the_rest` / `fully_outside_returns_zero_and_writes_nothing` | 越界裁剪 |
 | `hotspot_does_not_shift_placement` | **位置是左上角**，热点不参与 |
-| `overlay_rect_clips_to_frame` | GPU 包围盒的三种越界 |
+| `bounds_is_union_and_clipped`（`overlay`） | 包围盒是并集、且裁到画面内 |
 | `unknown_shape_type_is_ignored` / `zero_sized_shape_rejected` | 退化输入不 panic |
-| `gpu_cursor_is_composited_and_leaves_no_trail`（`#[ignore]`） | 显存内合成：位置对、无残影、不可见不画 |
+| `gpu_cursor_is_composited_and_leaves_no_trail`（`#[ignore]`） | 显存内合成：位置对、无残影、不可见不画、动画帧可重绘并抹净 |
 | `e2e_cursor.rs` 两个用例（`#[ignore]`） | 真实桌面：真取到形状、真移动到编码像素上；关闭开关时完全不采 |
 
 ## 12. 实现复盘
