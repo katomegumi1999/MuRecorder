@@ -4,5 +4,7 @@
 
 pub mod dxgi;
 pub mod gdi;
+pub mod wasapi;
 
 pub use dxgi::{CaptureTarget, CapturedFrame, DxgiCapture};
+pub use wasapi::{AudioCapture, AudioSourceSpec, PcmPacket};

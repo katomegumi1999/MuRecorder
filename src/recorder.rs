@@ -16,15 +16,17 @@
 //! drop packet_tx → mux 排空后 finish 退出 → join 全部线程 → 状态转 Stopped。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::capture::wasapi::{AudioCapture, AudioSourceSpec};
 use crate::capture::{DxgiCapture, dxgi};
 use crate::config::{AudioSourceType, EncoderPreference, RecordingConfig};
 use crate::encode::VideoEncoder;
+use crate::encode::aac::{AacEncoder, AacPacket};
 use crate::encode::mf_sink::{ContainerMode, GpuCodec, GpuSinkWriter};
 use crate::error::{RecorderError, RecorderResult};
 use crate::mux::mp4::Mp4Muxer;
@@ -65,13 +67,84 @@ pub struct VideoFrame {
     pub pts_us: u64,
 }
 
-/// 线程间流转的编码包。
+/// 线程间流转的视频编码包。
 struct PacketMsg {
     data: Vec<u8>,
     is_key: bool,
     sps: Vec<u8>,
     pps: Vec<u8>,
     pts_us: u64,
+}
+
+/// 封装线程接收的多轨消息枚举。
+enum MuxMsg {
+    Video(PacketMsg),
+    Audio(AacPacket),
+}
+
+#[repr(C)]
+struct OsVersionInfoExW {
+    dw_os_version_info_size: u32,
+    dw_major_version: u32,
+    dw_minor_version: u32,
+    dw_build_number: u32,
+    dw_platform_id: u32,
+    sz_csd_version: [u16; 128],
+    w_service_pack_major: u16,
+    w_service_pack_minor: u16,
+    w_suite_mask: u16,
+    w_product_type: u8,
+    w_reserved: u8,
+}
+
+unsafe extern "system" {
+    fn RtlGetVersion(lpVersionInformation: *mut OsVersionInfoExW) -> i32;
+}
+
+fn windows_build_number() -> u32 {
+    let mut info: OsVersionInfoExW = unsafe { std::mem::zeroed() };
+    info.dw_os_version_info_size = std::mem::size_of::<OsVersionInfoExW>() as u32;
+    if unsafe { RtlGetVersion(&mut info) } == 0 {
+        info.dw_build_number
+    } else {
+        0
+    }
+}
+
+fn resolve_audio_spec(cfg: &RecordingConfig) -> Result<Option<AudioSourceSpec>, RecorderError> {
+    match cfg.audio_source {
+        AudioSourceType::None => Ok(None),
+        AudioSourceType::System => Ok(Some(AudioSourceSpec::DefaultRender)),
+        AudioSourceType::Device => {
+            let id = cfg
+                .audio_device_id
+                .as_ref()
+                .ok_or_else(|| RecorderError::invalid("AUDIO_DEVICE 必须指定 audio_device_id"))?;
+            Ok(Some(AudioSourceSpec::DeviceId(id.clone())))
+        }
+        AudioSourceType::Window => {
+            if windows_build_number() < 19041 {
+                return Err(RecorderError::invalid(
+                    "进程环回需要 Windows 10 2004（build 19041）及以上系统版本",
+                ));
+            }
+            let mut pid = cfg.audio_process_id;
+            if pid == 0 && cfg.audio_window_hwnd != 0 {
+                unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                        windows::Win32::Foundation::HWND(cfg.audio_window_hwnd as *mut _),
+                        Some(&mut pid),
+                    );
+                }
+            }
+            if pid == 0 {
+                return Err(RecorderError::invalid(
+                    "AUDIO_WINDOW 必须指定有效的 window_hwnd 或 process_id",
+                ));
+            }
+            Ok(Some(AudioSourceSpec::ProcessTree(pid)))
+        }
+    }
 }
 
 /// 线程共享环境：停止/致命错误信号 + 错误记录 + 统计。
@@ -81,6 +154,12 @@ pub struct PipelineEnv {
     pub stop: Arc<AtomicBool>,
     pub fatal: Arc<AtomicBool>,
     pub last_error: Arc<Mutex<Option<(i32, String)>>>,
+    /// **首个**致命错误，只写一次。`last_error` 是「最新一条」，会被后来的
+    /// 线程覆盖，而流水线里后面的线程往往是**受害者**：音频线程先挂 → 采集
+    /// 线程立刻退出 → mux 线程收尾时发现 0 样本 → 报「未捕获到任何帧」。
+    /// 真正的原因（音频初始化失败）就这样被埋掉，用户看到的永远是最后那条
+    /// 派生的、且指向错误方向的信息。所以根因单独留一份。
+    pub fatal_root: Arc<Mutex<Option<(i32, String)>>>,
     pub stats: Arc<StatsSampler>,
 }
 
@@ -91,11 +170,28 @@ impl PipelineEnv {
     }
 
     /// 置致命错误并请求全流水线停止。
+    ///
+    /// `fatal_root` 只保留第一次调用时的信息（根因）；`last_error` 每次都更新
+    /// （给 UI 显示最新状态）。两者在单故障场景下相同，多故障级联时才有区别。
     pub fn fail(&self, code: RecorderResult, msg: String) {
         self.fatal.store(true, Ordering::SeqCst);
         self.stats.set_last_error(code.code());
+        {
+            let mut root = self.fatal_root.lock().unwrap();
+            if root.is_none() {
+                *root = Some((code.code(), msg.clone()));
+            }
+        }
         self.record(code, msg);
         self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// 根因（首个致命错误），没有则回退到最新错误。
+    pub fn root_error(&self) -> Option<(i32, String)> {
+        if let Some(e) = self.fatal_root.lock().unwrap().clone() {
+            return Some(e);
+        }
+        self.last_error.lock().unwrap().clone()
     }
 }
 
@@ -118,16 +214,13 @@ pub struct Recorder {
 impl Recorder {
     /// `recorder_create`：只分配、不启动。
     pub fn created(config: RecordingConfig) -> Result<Self, RecorderError> {
-        // M1 仅支持无音频；音频能力随 M4 WASAPI 落地开放。
-        if config.audio_source != AudioSourceType::None {
-            return Err(RecorderError::invalid(
-                "M1 版本不支持音频录制（audio_source 必须为 AUDIO_NONE）",
-            ));
-        }
+        // 校验音源配置
+        let _ = resolve_audio_spec(&config)?;
         let env = PipelineEnv {
             stop: Arc::new(AtomicBool::new(false)),
             fatal: Arc::new(AtomicBool::new(false)),
             last_error: Arc::new(Mutex::new(None)),
+            fatal_root: Arc::new(Mutex::new(None)),
             stats: Arc::new(StatsSampler::new(ENCODER_SOFT_OPENH264)),
         };
         Ok(Self {
@@ -230,6 +323,11 @@ impl Recorder {
                             cfg.bitrate_kbps,
                             codec,
                             container,
+                            if cfg.audio_source != crate::config::AudioSourceType::None {
+                                Some(cfg.audio_bitrate_kbps)
+                            } else {
+                                None
+                            },
                         ) {
                             Ok(sink) => {
                                 if container == ContainerMode::Plain {
@@ -263,22 +361,74 @@ impl Recorder {
             }
         }
 
+        let audio_spec = resolve_audio_spec(&cfg)?;
+
+        // ★ 音频链路在 **start 阶段**就探一遍，不要等线程跑起来再失败。
+        //
+        // 早期实现只在音频线程内部建 `AudioCapture` / `AacEncoder`，失败了走
+        // `env.fail`——而 `recorder_start` 早就返回成功了。宿主看到的是「开始录制
+        // 成功」，直到几秒后点停止才拿到一个错误，中间还白录了一段没有声音的视频。
+        // 录屏软件里这是最糟的交互：用户以为在录。
+        //
+        // 预检内容：设备能否打开（是否被禁用/独占）+（软编路径）AAC MFT 是否可用。
+        // GPU 路径的 AAC 由 SinkWriter 内建，且 `GpuSinkWriter::try_new` 已经把流
+        // 加进去了，所以只需要探设备。
+        if let Some(spec) = &audio_spec {
+            preflight_audio(spec, gpu_session.is_none(), cfg.audio_bitrate_kbps)?;
+        }
+
         if let Some((capture, gpu_sink, enc_type)) = gpu_session {
             self.sampler.set_encoder_type(enc_type);
+
+            let t0 = Arc::new(AtomicU64::new(0));
+            let (audio_tx, audio_rx) = if audio_spec.is_some() {
+                let (tx, rx) = sync_channel::<(Vec<u8>, u64)>(200);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+
+            if let Some(spec) = audio_spec {
+                let tx = audio_tx.unwrap();
+                let env_audio = self.env.clone();
+                let t0_audio = Arc::clone(&t0);
+                let freq = dxgi::qpc_frequency();
+                let handle = std::thread::Builder::new()
+                    .name("murec-audio".into())
+                    .spawn(move || {
+                        // GPU 路径的 AAC 由 SinkWriter 内建，本线程只做采集，
+                        // 但 WASAPI 同样需要 COM 套间。
+                        let _com = crate::com::ComApartment::init_mta();
+                        audio_capture_loop(spec, t0_audio, freq, env_audio, |pcm, pts_us| {
+                            if tx.try_send((pcm.to_vec(), pts_us)).is_err() {
+                                eprintln!("[murec] 音频：队列溢出，丢弃音频包");
+                            }
+                            Ok(())
+                        });
+                    })
+                    .map_err(|e| RecorderError::io(format!("audio 线程创建失败: {e}")))?;
+                self.threads.push(handle);
+            }
 
             let env = self.env.clone();
             let cfg_clone = cfg.clone();
             let handle = std::thread::Builder::new()
                 .name("murec-gpu".into())
-                .spawn(move || gpu_recorder_thread(cfg_clone, capture, gpu_sink, env))
+                .spawn(move || gpu_recorder_thread(cfg_clone, capture, gpu_sink, t0, audio_rx, env))
                 .map_err(|e| RecorderError::io(format!("GPU 录制线程创建失败: {e}")))?;
             self.threads.push(handle);
         } else {
             // Level 3: CPU 软编流水线
             self.sampler.set_encoder_type(ENCODER_SOFT_OPENH264);
 
+            let t0 = Arc::new(AtomicU64::new(0));
             let (frame_tx, frame_rx) = sync_channel::<VideoFrame>(FRAME_RING_DEPTH);
-            let (packet_tx, packet_rx) = sync_channel::<PacketMsg>(PACKET_QUEUE_DEPTH);
+            let (mux_tx, mux_rx) = sync_channel::<MuxMsg>(PACKET_QUEUE_DEPTH);
+            let audio_kbps = if audio_spec.is_some() {
+                Some(cfg.audio_bitrate_kbps)
+            } else {
+                None
+            };
             let env = self.env.clone();
 
             // ---- mux 线程（最先起，确保编码线程有消费者）----
@@ -288,7 +438,7 @@ impl Recorder {
                 let (w, h, fps) = (enc_w, enc_h, cfg.fps);
                 let handle = std::thread::Builder::new()
                     .name("murec-mux".into())
-                    .spawn(move || mux_thread(path, w, h, fps, packet_rx, env))
+                    .spawn(move || mux_thread(path, w, h, fps, audio_kbps, mux_rx, env))
                     .map_err(|e| RecorderError::io(format!("mux 线程创建失败: {e}")))?;
                 self.threads.push(handle);
             }
@@ -297,19 +447,81 @@ impl Recorder {
             {
                 let env = env.clone();
                 let (w, h, fps, kbps) = (enc_w, enc_h, cfg.fps, cfg.bitrate_kbps);
+                let mux_tx_enc = mux_tx.clone();
                 let handle = std::thread::Builder::new()
                     .name("murec-encode".into())
-                    .spawn(move || encode_thread(frame_rx, packet_tx, w, h, fps, kbps, env))
+                    .spawn(move || encode_thread(frame_rx, mux_tx_enc, w, h, fps, kbps, env))
                     .map_err(|e| RecorderError::io(format!("encode 线程创建失败: {e}")))?;
                 self.threads.push(handle);
             }
 
+            // ---- audio 线程（若启用）----
+            if let Some(spec) = audio_spec {
+                let env_audio = env.clone();
+                let t0_audio = Arc::clone(&t0);
+                let freq = dxgi::qpc_frequency();
+                let mux_tx_audio = mux_tx.clone();
+                let audio_bitrate = cfg.audio_bitrate_kbps;
+                let handle = std::thread::Builder::new()
+                    .name("murec-audio".into())
+                    .spawn(move || {
+                        // 套间必须在线程入口拿到，且**早于**任何 COM/MF 调用：
+                        // 下面第一件事就是建 AAC 编码器（MFT 属于 COM 服务）。
+                        // 这里必须最先声明：Rust 局部变量按声明**逆序**析构，
+                        // 只有声明在最前面，它才会在最后析构。
+                        let com = crate::com::ComApartment::init_mta();
+                        let mut aac_enc = match AacEncoder::with_bitrate_kbps(audio_bitrate) {
+                            Ok(enc) => enc,
+                            Err(e) => {
+                                env_audio.fail(
+                                    RecorderResult::NoEncoder,
+                                    format!("AAC 编码器创建失败: {e}"),
+                                );
+                                return;
+                            }
+                        };
+
+                        audio_capture_loop(spec, t0_audio, freq, env_audio.clone(), |pcm, _| {
+                            aac_enc
+                                .push_pcm(pcm)
+                                .map_err(|e| format!("AAC 喂入失败: {e}"))?;
+                            let packets =
+                                aac_enc.drain().map_err(|e| format!("AAC 取包失败: {e}"))?;
+                            for aac in packets {
+                                if mux_tx_audio.send(MuxMsg::Audio(aac)).is_err() {
+                                    return Err("mux 队列已关闭".into());
+                                }
+                            }
+                            Ok(())
+                        });
+
+                        if let Ok(finish_pkts) = aac_enc.finish() {
+                            for aac in finish_pkts {
+                                let _ = mux_tx_audio.send(MuxMsg::Audio(aac));
+                            }
+                        }
+
+                        // ★ 顺序红线：`aac_enc` 持有 IMFTransform（COM 对象），必须在
+                        // `com` 之前析构。早期实现把 `CoUninitialize()` 写在采集循环
+                        // 末尾（比这里更早），于是 MFT 的 Release 跑在「COM 已关闭」的
+                        // 线程上——它不报错，而是直接在进程里触发访问违例，
+                        // 表现为「停止录制时随机崩溃且没有任何 Rust panic」。
+                        drop(aac_enc);
+                        drop(com);
+                    })
+                    .map_err(|e| RecorderError::io(format!("audio 线程创建失败: {e}")))?;
+                self.threads.push(handle);
+            }
+
+            drop(mux_tx);
+
             // ---- capture 线程 ----
             {
                 let env = env.clone();
+                let t0_cap = Arc::clone(&t0);
                 let handle = std::thread::Builder::new()
                     .name("murec-capture".into())
-                    .spawn(move || capture_thread(cfg, frame_tx, env))
+                    .spawn(move || capture_thread(cfg, t0_cap, frame_tx, env))
                     .map_err(|e| RecorderError::io(format!("capture 线程创建失败: {e}")))?;
                 self.threads.push(handle);
             }
@@ -379,8 +591,11 @@ impl Recorder {
         // 流水线致命错误（设备丢失重建耗尽 / 磁盘错误 / 0 样本收尾失败）必须让
         // stop 的调用方知道：否则 UI 会报告"已保存"，用户拿到的是不完整文件。
         // 注意 stop 自身成功但录制中途失败也走这里。
+        //
+        // 报的是**根因**（首个致命错误）而不是最后一条：级联故障下最后一条往往是
+        // 派生结论（「未捕获到任何帧」），会把人引向磁盘/画面静止，而真因在别处。
         if self.env.fatal.load(Ordering::Relaxed) {
-            if let Some((code, msg)) = self.env.last_error.lock().unwrap().clone() {
+            if let Some((code, msg)) = self.env.root_error() {
                 return Err(RecorderError::new(RecorderResult::from_code(code), msg));
             }
         }
@@ -399,13 +614,251 @@ impl Recorder {
 
     /// `recorder_get_last_error`：拷贝最近一次错误信息（无错误时空串）。
     pub fn last_error_string(&self) -> String {
+        // 与 `stop()` 一致，优先给**根因**：级联故障下最后一条往往是派生结论，
+        // 对排查没有帮助。
         self.env
-            .last_error
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|(_, msg)| msg.clone())
+            .root_error()
+            .map(|(_, msg)| msg)
             .unwrap_or_default()
+    }
+}
+
+/// 在 `recorder_start` 阶段预检音频链路，让不可用的情况**立刻**报错。
+///
+/// 单独起一个线程做这件事，是因为 COM 套间是按线程的，而 `recorder_start` 的
+/// 调用方是宿主（多半是 C# 的 UI 线程）。我们既不该假设它初始化过 COM，
+/// 更不该在别人的线程上改套间模型——那会污染宿主的 COM 使用方式。
+///
+/// `need_aac` 为真时还会实例化一次 AAC MFT：这一步能提前抓到「系统缺少 AAC
+/// 编码器」这类环境问题，而不是录到一半才发现。
+fn preflight_audio(
+    spec: &AudioSourceSpec,
+    need_aac: bool,
+    bitrate_kbps: u32,
+) -> Result<(), RecorderError> {
+    let spec = spec.clone();
+    let probe = std::thread::Builder::new()
+        .name("murec-audio-probe".into())
+        .spawn(move || -> Result<(), String> {
+            let com = crate::com::ComApartment::init_mta();
+            if !com.is_usable() {
+                return Err("无法在当前线程初始化 COM 套间".to_string());
+            }
+            // 打开再关闭一次：只验证「设备可用、格式能被接受」，不采任何数据。
+            let capture =
+                AudioCapture::new(spec).map_err(|e| format!("音频采集设备不可用: {e}"))?;
+            // 先放掉采集端再建编码器：两者同时持有时某些驱动会拒绝。
+            drop(capture);
+            if need_aac {
+                let enc = AacEncoder::with_bitrate_kbps(bitrate_kbps)
+                    .map_err(|e| format!("系统缺少可用的 AAC 编码器: {e}"))?;
+                drop(enc);
+            }
+            Ok(())
+        })
+        .map_err(|e| RecorderError::io(format!("音频预检线程创建失败: {e}")))?;
+
+    match probe.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(msg)) => Err(RecorderError::io(format!("音频不可用：{msg}"))),
+        Err(_) => Err(RecorderError::io("音频预检线程异常退出")),
+    }
+}
+
+/// 按墙钟把已产出的采样数追平，差多少补多少静音。
+///
+/// loopback 在桌面静音时不出包、设备切换时也会空窗，缺的这段必须用**静音样本**
+/// 顶上去。不补的话音轨会短一截，音画从此永久错位（播放器不会报错，只是口型对不上）。
+///
+/// 只写 `produced_frames`，不动 anchor：anchor 是「音频起点在录制时间轴上的位置」，
+/// 补静音不改变起点；而 `produced_frames` 是样本表长度的唯一来源，两者不能混。
+fn pad_silence<F>(
+    wall: &std::time::Instant,
+    anchor_us: Option<u64>,
+    produced_frames: &mut u64,
+    on_pcm: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&[u8], u64) -> Result<(), String>,
+{
+    let Some(base_anchor) = anchor_us else {
+        return Ok(());
+    };
+    let target_frames = wall.elapsed().as_micros() as u64 * 48_000 / 1_000_000;
+    // 480 采样 = 10 ms 的容差，避免每轮都补一两帧导致包过碎。
+    if target_frames <= *produced_frames + 480 {
+        return Ok(());
+    }
+    // 一次最多补 250 ms：设备卡死很久时也不要一口气灌出几秒静音，
+    // 让下一轮继续追，时间轴更平滑。
+    let need = ((target_frames - *produced_frames) as u32).min(48_000 / 4);
+    let pts_us = base_anchor + (*produced_frames as u128 * 1_000_000 / 48_000) as u64;
+    let silent = vec![0u8; need as usize * 4];
+    *produced_frames += need as u64;
+    on_pcm(&silent, pts_us)
+}
+
+/// 通用 WASAPI loopback 采集与静音补包主循环。
+///
+/// **调用方负责 COM 套间**：本函数不会再调 `CoInitializeEx`。原因是采集循环之前
+/// 往往还要在同一线程里建 AAC 编码器（`AacEncoder` 走 MFT，属于 COM 服务），
+/// 若把套间初始化埋在循环内部，那些更早的调用就会在「未初始化 COM」的线程上跑——
+/// 症状是 `ActivateObject` 返回一个没有任何线索的 `E_FAIL`。初始化必须由线程入口
+/// 用 [`crate::com::ComApartment`] 统一持有。
+///
+/// ## 时基
+///
+/// PTS 一律由**累计采样数**推算（`anchor + produced * 1e6 / 48000`），QPC 只用来
+/// 建 anchor 和定期校正。这样音频时间轴是严格恒速的，不会因为某次 `poll` 迟到而
+/// 抖动——视频那边同理（帧号 × 间隔），两轨才对得齐。
+fn audio_capture_loop<F>(
+    spec: AudioSourceSpec,
+    t0: Arc<AtomicU64>,
+    freq: u64,
+    env: PipelineEnv,
+    mut on_pcm: F,
+) where
+    F: FnMut(&[u8], u64) -> Result<(), String>,
+{
+    let mut capture = match AudioCapture::new(spec) {
+        Ok(c) => c,
+        Err(e) => {
+            env.fail(
+                RecorderResult::Io,
+                format!("WASAPI 音频采集初始化失败: {e}"),
+            );
+            return;
+        }
+    };
+
+    let mut wall = std::time::Instant::now();
+    let mut produced_frames: u64 = 0;
+    // `Some` 表示已经起表。**不会**为空等真实数据包而一直挂着（见下）。
+    let mut anchor_us: Option<u64> = None;
+    let mut last_calib_qpc = 0u64;
+    let mut first_real_packet = true;
+    let mut rebuild_attempts = 0u32;
+
+    while !env.stop.load(Ordering::Relaxed) {
+        let t0_val = t0.load(Ordering::SeqCst);
+        if t0_val == 0 {
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+
+        // ★ 起表不能等第一个真实数据包。
+        //
+        // WASAPI loopback 在**桌面完全静音**时可以直接一个包都不给
+        // （音频引擎空闲，`GetNextPacketSize()` 恒为 0）。如果 anchor 只在收到
+        // 真实包时才建立，那么静音桌面上：anchor 永远为空 → 补静音永不触发 →
+        // 录出来的 MP4 有一条 **0 样本**的音轨。症状极隐蔽：录制正常、停止正常、
+        // 没有报错，只是没有声音。
+        //
+        // 正确的起表点就是录制起点 t0：音频和视频从同一时刻开始，
+        // anchor 先置 0，等第一个真实包到达时再按 QPC 校正一次（见下）。
+        if anchor_us.is_none() {
+            anchor_us = Some(0);
+            last_calib_qpc = t0_val;
+            wall = std::time::Instant::now();
+        }
+
+        match capture.poll() {
+            Ok(Some(pkt)) => {
+                rebuild_attempts = 0;
+
+                // 真实包时间戳早于录制起点时整包丢弃：那是 loopback 缓冲区里
+                // t0 之前就录到的内容，收进来会让音频比视频超前。
+                if pkt.qpc != 0 && pkt.qpc < t0_val {
+                    continue;
+                }
+
+                let base_anchor = anchor_us.unwrap_or(0);
+                let pts_us = base_anchor + (produced_frames as u128 * 1_000_000 / 48_000) as u64;
+
+                // 校正 anchor（只动 anchor，绝不动 produced_frames —— 后者是
+                // 样本表长度的唯一来源，动它会让 stts 与实际字节数脱节）。
+                // 首个真实包必须校正一次：静音期间补出来的静音帧是按墙钟拍的，
+                // 而设备时钟可能比墙钟快/慢一点，第一包就是对齐设备时钟的机会。
+                let force_calib = first_real_packet && pkt.qpc != 0;
+                if pkt.qpc != 0 && (force_calib || pkt.qpc > last_calib_qpc + 30 * freq) {
+                    let current_qpc_us = pkt.qpc.saturating_sub(t0_val) * 1_000_000 / freq;
+                    let drift_us = current_qpc_us as i64 - pts_us as i64;
+                    // 首包门槛放宽到 2 ms 以内；周期性校正沿用 5 ms。
+                    let limit = if force_calib { 2_000 } else { 5_000 };
+                    if drift_us.abs() > limit {
+                        anchor_us = Some((base_anchor as i64 + drift_us).max(0) as u64);
+                    }
+                    last_calib_qpc = pkt.qpc;
+                }
+                first_real_packet = false;
+
+                produced_frames += pkt.frames as u64;
+                if let Err(e) = on_pcm(&pkt.data, pts_us) {
+                    // 打一行 stderr：音频线程静默退出会让 mux 只能报「0 样本」，
+                    // 排查时看不到真正的原因。
+                    eprintln!("[murec] 音频：下游处理失败，线程退出: {e}");
+                    env.record(RecorderResult::Io, e);
+                    break;
+                }
+            }
+            Ok(None) => {
+                if let Err(e) = pad_silence(&wall, anchor_us, &mut produced_frames, &mut on_pcm) {
+                    eprintln!("[murec] 音频：补静音失败，线程退出: {e}");
+                    env.record(RecorderResult::Io, e);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => {
+                if e.code() == windows::Win32::Media::Audio::AUDCLNT_E_DEVICE_INVALIDATED {
+                    rebuild_attempts += 1;
+                    if rebuild_attempts > 10 {
+                        env.fail(
+                            RecorderResult::Io,
+                            format!("音频设备失效，连续 10 次重建失败: {e}"),
+                        );
+                        break;
+                    }
+                    eprintln!("[murec] 音频：设备失效，第 {rebuild_attempts} 次重建");
+                    // ★ 重建期间**必须继续补静音**。
+                    //
+                    // 切耳机、改默认输出设备、蓝牙重连，都会走到这里，耗时从几十
+                    // 毫秒到一两秒不等。早期实现只是 sleep(500ms) 然后 reset，
+                    // 这半秒钟一帧音频都不出，音轨就短了一块——而且**不会报错**，
+                    // 表现是「录了三分钟，从 1:20 开始音画不同步」。
+                    // 这里按 5 ms 一轮持续补静音，直到重建完成，时间轴不断。
+                    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+                    while std::time::Instant::now() < deadline && !env.stop.load(Ordering::Relaxed)
+                    {
+                        if let Err(e) =
+                            pad_silence(&wall, anchor_us, &mut produced_frames, &mut on_pcm)
+                        {
+                            eprintln!("[murec] 音频：重建期间补静音失败: {e}");
+                            env.record(RecorderResult::Io, e);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    // 重建成功后墙钟基准要跟着走：否则下一轮会把重建期间
+                    // 已经补过的静音再补一遍（重复计时间）。
+                    match capture.reset() {
+                        Ok(()) => {
+                            rebuild_attempts = 0;
+                            let produced_us = (produced_frames as u128 * 1_000_000 / 48_000) as u64;
+                            wall = std::time::Instant::now()
+                                - std::time::Duration::from_micros(produced_us);
+                        }
+                        Err(re) => env.record(
+                            RecorderResult::DeviceLost,
+                            format!("音频设备重连中（第 {rebuild_attempts} 次）: {re}"),
+                        ),
+                    }
+                } else {
+                    env.record(RecorderResult::Invalid, format!("音频采集轮询错误: {e}"));
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
     }
 }
 
@@ -414,16 +867,18 @@ fn gpu_recorder_thread(
     cfg: RecordingConfig,
     mut capture: DxgiCapture,
     mut gpu_sink: GpuSinkWriter,
+    t0: Arc<AtomicU64>,
+    audio_rx: Option<Receiver<(Vec<u8>, u64)>>,
     env: PipelineEnv,
 ) {
-    let _ = unsafe {
-        windows::Win32::System::Com::CoInitializeEx(
-            None,
-            windows::Win32::System::Com::COINIT_MULTITHREADED,
-        )
-    };
+    // 套间必须**最先声明**：本函数的形参（`capture` / `gpu_sink`）持有 DXGI 与
+    // MF 的 COM 对象，按「逆序析构」规则它们会先于 `com` 释放。若像早期实现那样
+    // 在函数末尾显式 `CoUninitialize()`，那些对象就会在 COM 已关闭的线程上 Release，
+    // 直接访问违例（没有 Rust panic，进程当场死）。
+    let _com = crate::com::ComApartment::init_mta();
 
     let start_qpc = dxgi::qpc_now();
+    t0.store(start_qpc, Ordering::SeqCst);
     let freq = dxgi::qpc_frequency();
     let interval_ticks = (freq / cfg.fps as u64).max(1);
     let mut next_frame_qpc = start_qpc + interval_ticks;
@@ -442,6 +897,16 @@ fn gpu_recorder_thread(
     let approx_bytes_per_frame = ((cfg.bitrate_kbps as u64 * 1000) / 8) / (cfg.fps.max(1) as u64);
 
     while !env.stop.load(Ordering::Relaxed) {
+        // 及时清空音频积压并注入 SinkWriter
+        if let Some(rx) = &audio_rx {
+            while let Ok((pcm, pts_us)) = rx.try_recv() {
+                if let Err(e) = gpu_sink.push_audio_pcm(&pcm, pts_us) {
+                    env.record(RecorderResult::Io, format!("GPU 写入音频失败: {e}"));
+                    break;
+                }
+            }
+        }
+
         dxgi::precise_sleep_until(next_frame_qpc);
         next_frame_qpc = next_frame_qpc.saturating_add(interval_ticks);
         let now = dxgi::qpc_now();
@@ -544,6 +1009,13 @@ fn gpu_recorder_thread(
         }
     }
 
+    // 排空剩余音频
+    if let Some(rx) = &audio_rx {
+        while let Ok((pcm, pts_us)) = rx.try_recv() {
+            let _ = gpu_sink.push_audio_pcm(&pcm, pts_us);
+        }
+    }
+
     // 录制结束，收尾硬件编码器并写入 MP4 索引头
     if let Err(e) = gpu_sink.finish() {
         let frames = env.stats.stats().frames_captured();
@@ -555,12 +1027,16 @@ fn gpu_recorder_thread(
         let note = preserve_or_remove(&cfg.output_path, frames);
         env.fail(RecorderResult::Io, format!("{msg}{note}"));
     }
-
-    unsafe { windows::Win32::System::Com::CoUninitialize() };
+    // `com` 在这里（形参之后）才析构，COM 对象才不会悬空。
 }
 
 /// capture 线程主循环。
-fn capture_thread(cfg: RecordingConfig, frame_tx: SyncSender<VideoFrame>, env: PipelineEnv) {
+fn capture_thread(
+    cfg: RecordingConfig,
+    t0: Arc<AtomicU64>,
+    frame_tx: SyncSender<VideoFrame>,
+    env: PipelineEnv,
+) {
     let target = match dxgi::find_target(cfg.region_x, cfg.region_y, cfg.region_w, cfg.region_h) {
         Ok(t) => t,
         Err(e) => {
@@ -584,6 +1060,7 @@ fn capture_thread(cfg: RecordingConfig, frame_tx: SyncSender<VideoFrame>, env: P
     };
 
     let start_qpc = dxgi::qpc_now();
+    t0.store(start_qpc, Ordering::SeqCst);
     let freq = dxgi::qpc_frequency();
     let interval_ticks = (freq / cfg.fps as u64).max(1);
     let mut next_frame_qpc = start_qpc + interval_ticks;
@@ -713,7 +1190,7 @@ fn capture_thread(cfg: RecordingConfig, frame_tx: SyncSender<VideoFrame>, env: P
 /// encode 线程主循环：BGRA→I420→H.264→包队列。
 fn encode_thread(
     frame_rx: Receiver<VideoFrame>,
-    packet_tx: SyncSender<PacketMsg>,
+    mux_tx: SyncSender<MuxMsg>,
     width: u32,
     height: u32,
     fps: u32,
@@ -738,14 +1215,14 @@ fn encode_thread(
         match encoder.encode(&i420) {
             Ok(packet) => {
                 env.stats.stats().on_frame_encoded(packet.data.len() as u64);
-                if packet_tx
-                    .send(PacketMsg {
+                if mux_tx
+                    .send(MuxMsg::Video(PacketMsg {
                         data: packet.data,
                         is_key: packet.is_key,
                         sps: packet.sps,
                         pps: packet.pps,
                         pts_us: frame.pts_us,
-                    })
+                    }))
                     .is_err()
                 {
                     // mux 线程已退出：不应发生（mux 只在通道关闭后退出），防御性处理。
@@ -779,16 +1256,22 @@ fn drain_one(rx: &Receiver<VideoFrame>, env: &PipelineEnv) -> Option<VideoFrame>
     }
 }
 
-/// mux 线程主循环：流式写 MP4，收尾时生成 faststart moov。
+/// mux 线程主循环：流式写多轨 MP4，收尾时生成 faststart moov。
 fn mux_thread(
     path: PathBuf,
     width: u32,
     height: u32,
     fps: u32,
-    packet_rx: Receiver<PacketMsg>,
+    audio_bitrate_kbps: Option<u32>,
+    msg_rx: Receiver<MuxMsg>,
     env: PipelineEnv,
 ) {
-    let mut muxer = match Mp4Muxer::create(&path, width, height, fps) {
+    let mut muxer = match Mp4Muxer::create_multi_with_audio_bitrate(
+        &path,
+        Some((width, height, fps)),
+        audio_bitrate_kbps.map(|_| (2, 48_000)),
+        audio_bitrate_kbps.unwrap_or(320) * 1000,
+    ) {
         Ok(m) => m,
         Err(e) => {
             env.fail(
@@ -799,16 +1282,27 @@ fn mux_thread(
         }
     };
 
-    while let Some(packet) = drain_packet(&packet_rx, &env) {
-        if let Err(e) = muxer.write_sample(
-            &packet.data,
-            packet.pts_us,
-            packet.is_key,
-            &packet.sps,
-            &packet.pps,
-        ) {
-            env.fail(RecorderResult::Io, format!("写入样本失败: {e}"));
-            break;
+    while let Some(msg) = drain_mux_msg(&msg_rx, &env) {
+        match msg {
+            MuxMsg::Video(packet) => {
+                if let Err(e) = muxer.write_sample(
+                    &packet.data,
+                    packet.pts_us,
+                    packet.is_key,
+                    &packet.sps,
+                    &packet.pps,
+                ) {
+                    env.fail(RecorderResult::Io, format!("写入视频样本失败: {e}"));
+                    break;
+                }
+            }
+            MuxMsg::Audio(packet) => {
+                let pts_ticks = (packet.pts_us as u128 * 48_000 / 1_000_000) as u64;
+                if let Err(e) = muxer.write_audio_sample(&packet.data, pts_ticks) {
+                    env.fail(RecorderResult::Io, format!("写入音频样本失败: {e}"));
+                    break;
+                }
+            }
         }
     }
 
@@ -851,7 +1345,7 @@ fn preserve_or_remove(path: &str, frames: u64) -> String {
     }
 }
 
-fn drain_packet(rx: &Receiver<PacketMsg>, env: &PipelineEnv) -> Option<PacketMsg> {
+fn drain_mux_msg(rx: &Receiver<MuxMsg>, env: &PipelineEnv) -> Option<MuxMsg> {
     loop {
         match rx.recv_timeout(DRAIN_POLL) {
             Ok(p) => return Some(p),
@@ -884,13 +1378,124 @@ mod tests {
             audio_device_id: None,
             audio_window_hwnd: 0,
             audio_process_id: 0,
+            audio_bitrate_kbps: 320,
         }
     }
 
     #[test]
-    fn created_rejects_audio_in_m1() {
-        assert!(Recorder::created(test_config(AudioSourceType::System)).is_err());
+    fn created_accepts_audio_or_none() {
+        assert!(Recorder::created(test_config(AudioSourceType::System)).is_ok());
         assert!(Recorder::created(test_config(AudioSourceType::None)).is_ok());
+    }
+
+    /// 预检必须在下标不存在的端点上报错，且错误信息指向「音频不可用」，
+    /// 这样宿主能立刻把「开始录制失败」呈现给用户，而不是录完才发现没声音。
+    #[test]
+    fn preflight_rejects_unknown_endpoint() {
+        let spec = AudioSourceSpec::DeviceId("{0.0.0.00000000}.{not-a-real-endpoint}".into());
+        let err = preflight_audio(&spec, false, 320).expect_err("不存在的端点必须预检失败");
+        assert!(
+            err.message().contains("音频不可用"),
+            "错误信息应点明音频不可用，实际：{}",
+            err.message()
+        );
+    }
+
+    /// 静音补包：按墙钟把采样数追平，且 pts 从 anchor 起算。
+    #[test]
+    fn pad_silence_catches_up_to_wall_clock() {
+        let mut produced = 0u64;
+        let mut got: Vec<(usize, u64)> = Vec::new();
+        let mut sink = |data: &[u8], pts: u64| {
+            got.push((data.len() / 4, pts));
+            Ok(())
+        };
+
+        // 墙钟已经走了 100 ms → 应补约 4800 帧
+        let wall = std::time::Instant::now() - Duration::from_millis(100);
+        pad_silence(&wall, Some(5_000), &mut produced, &mut sink).unwrap();
+
+        // 不要写死 4800：`wall` 构造完成到 `pad_silence` 真正读时钟之间还会走掉
+        // 几十微秒，4801、4802 都是正常值。这里断言「追上 10 ms 容差以内」。
+        let target = 4_800u64;
+        assert!(
+            produced >= target && produced <= target + 480,
+            "100 ms 后应补到约 4800 采样（容差 10 ms），实际 {produced}"
+        );
+        assert_eq!(got.len(), 1, "一次补齐，不要切成很多碎包");
+        assert_eq!(got[0].1, 5_000, "pts 应等于 anchor");
+    }
+
+    /// 音频不可用时 `start()` 必须**立刻**失败，不能等停止时才报。
+    ///
+    /// 这条用例同时锁住了两件事：软编路径不依赖桌面会话（不需要 DXGI），
+    /// 以及音频预检发生在任何线程/文件之前——失败时不留垃圾、不留悬挂线程。
+    #[test]
+    fn start_fails_fast_when_audio_device_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(AudioSourceType::Device);
+        cfg.encoder = crate::config::EncoderPreference::Soft;
+        cfg.output_path = dir.path().join("out.mp4").to_string_lossy().to_string();
+        cfg.audio_device_id = Some("{0.0.0.00000000}.{not-a-real-endpoint}".into());
+
+        let mut rec = Recorder::created(cfg).unwrap();
+        let err = rec.start().expect_err("音频设备不存在时 start 必须失败");
+        assert!(
+            err.message().contains("音频不可用"),
+            "start 的错误应点明音频不可用，实际：{}",
+            err.message()
+        );
+        // 状态没有推进到 Running，宿主持有的句柄还能正常销毁。
+        assert_eq!(rec.state(), RecorderState::Created);
+        // 不该留下 0 字节的输出文件。
+        assert!(
+            !std::path::Path::new(&rec.config.output_path).exists(),
+            "预检失败不应创建输出文件"
+        );
+    }
+    /// 已经追平就不该再补：否则每轮都多吐几帧，音轨会越补越长。
+    #[test]
+    fn pad_silence_is_idempotent_within_tolerance() {
+        let mut produced = 0u64;
+        let mut count = 0usize;
+        let mut sink = |_d: &[u8], _p: u64| {
+            count += 1;
+            Ok(())
+        };
+        let wall = std::time::Instant::now() - Duration::from_millis(100);
+        pad_silence(&wall, Some(0), &mut produced, &mut sink).unwrap();
+        let after_first = produced;
+        // 同一个墙钟再补一次：应完全不动
+        pad_silence(&wall, Some(0), &mut produced, &mut sink).unwrap();
+        assert_eq!(produced, after_first, "同一时刻重复补静音不应叠加");
+        assert_eq!(count, 1, "第二次调用不应产出任何包");
+    }
+
+    /// 尚未起表（anchor 为 None）时不补——此时连录制起点都不知道。
+    #[test]
+    fn pad_silence_noop_without_anchor() {
+        let mut produced = 0u64;
+        let mut count = 0usize;
+        let mut sink = |_d: &[u8], _p: u64| {
+            count += 1;
+            Ok(())
+        };
+        let wall = std::time::Instant::now() - Duration::from_millis(1000);
+        pad_silence(&wall, None, &mut produced, &mut sink).unwrap();
+        assert_eq!(produced, 0);
+        assert_eq!(count, 0);
+    }
+
+    /// 单次补静音有 250 ms 上限：设备卡死很久时不要一口气灌出几秒静音，
+    /// 而是分几轮追上，时间轴更平滑。
+    #[test]
+    fn pad_silence_caps_single_burst() {
+        let mut produced = 0u64;
+        let mut sink = |_d: &[u8], _p: u64| Ok(());
+        // 墙钟走了 3 秒
+        let wall = std::time::Instant::now() - Duration::from_millis(3_000);
+        pad_silence(&wall, Some(0), &mut produced, &mut sink).unwrap();
+        assert_eq!(produced, 12_000, "单次最多补 250 ms（12000 采样）");
     }
 
     #[test]
@@ -922,11 +1527,6 @@ mod tests {
 
     /// 编码 → 封装 的真实流水线测试：合成 BGRA 帧驱动 `encode_thread` + `mux_thread`
     /// （与生产运行时完全相同的两个线程函数），校验落盘的 mp4 结构。
-    ///
-    /// 为什么不走 DXGI 捕获：桌面复制只在画面变化时交付帧，CI/无人值守环境下桌面
-    /// 静止会导致一帧都拿不到，测试结果取决于环境。捕获层由 ffmpeg/浏览器级手工
-    /// 验证与 `capture` 模块的单元测试覆盖，这里用合成帧把「真实编码器 + 真实封装器」
-    /// 这一段锁死，属于确定性覆盖。
     #[test]
     fn pipeline_encodes_synthetic_frames_into_valid_mp4() {
         const W: u32 = 320;
@@ -942,11 +1542,12 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             fatal: Arc::new(AtomicBool::new(false)),
             last_error: Arc::new(Mutex::new(None)),
+            fatal_root: Arc::new(Mutex::new(None)),
             stats: Arc::new(StatsSampler::new(ENCODER_SOFT_OPENH264)),
         };
 
         let (frame_tx, frame_rx) = sync_channel::<VideoFrame>(FRAME_RING_DEPTH);
-        let (packet_tx, packet_rx) = sync_channel::<PacketMsg>(PACKET_QUEUE_DEPTH);
+        let (packet_tx, packet_rx) = sync_channel::<MuxMsg>(PACKET_QUEUE_DEPTH);
 
         let encode_env = env.clone();
         let encode = std::thread::spawn(move || {
@@ -954,7 +1555,8 @@ mod tests {
         });
         let mux_env = env.clone();
         let mux_path = path.clone();
-        let mux = std::thread::spawn(move || mux_thread(mux_path, W, H, FPS, packet_rx, mux_env));
+        let mux =
+            std::thread::spawn(move || mux_thread(mux_path, W, H, FPS, None, packet_rx, mux_env));
 
         // 合成帧：每帧一个向右移动的色块，保证帧间有真实残差（不是全静止画面）。
         let stride = W * 4;
@@ -1054,5 +1656,201 @@ mod tests {
         cfg.encoder = EncoderPreference::Soft;
         let rec = Recorder::created(cfg).unwrap();
         assert_eq!(rec.config.encoder, EncoderPreference::Soft);
+    }
+
+    #[test]
+    fn pipeline_encodes_synthetic_video_and_audio_into_dual_track_mp4() {
+        const W: u32 = 320;
+        const H: u32 = 240;
+        const FPS: u32 = 15;
+        const KBPS: u32 = 800;
+        const FRAMES: u32 = 15; // 1 秒视频
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dual_track.mp4");
+
+        let env = PipelineEnv {
+            stop: Arc::new(AtomicBool::new(false)),
+            fatal: Arc::new(AtomicBool::new(false)),
+            last_error: Arc::new(Mutex::new(None)),
+            fatal_root: Arc::new(Mutex::new(None)),
+            stats: Arc::new(StatsSampler::new(ENCODER_SOFT_OPENH264)),
+        };
+
+        let (frame_tx, frame_rx) = sync_channel::<VideoFrame>(FRAME_RING_DEPTH);
+        let (mux_tx, mux_rx) = sync_channel::<MuxMsg>(PACKET_QUEUE_DEPTH);
+
+        let encode_env = env.clone();
+        let encode_mux_tx = mux_tx.clone();
+        let encode = std::thread::spawn(move || {
+            encode_thread(frame_rx, encode_mux_tx, W, H, FPS, KBPS, encode_env)
+        });
+        let mux_env = env.clone();
+        let mux_path = path.clone();
+        let mux =
+            std::thread::spawn(move || mux_thread(mux_path, W, H, FPS, Some(320), mux_rx, mux_env));
+
+        let stride = W * 4;
+        for i in 0..FRAMES {
+            let mut bgra = vec![0x20u8; (stride * H) as usize];
+            let x0 = (i * 12) as usize;
+            for y in 0..H as usize {
+                for x in x0..(x0 + 24).min(W as usize) {
+                    let p = y * stride as usize + x * 4;
+                    bgra[p] = 0x30;
+                    bgra[p + 1] = 0x80;
+                    bgra[p + 2] = 0xE0;
+                    bgra[p + 3] = 0xFF;
+                }
+            }
+            frame_tx
+                .send(VideoFrame {
+                    bgra: bgra.into(),
+                    stride,
+                    width: W,
+                    height: H,
+                    pts_us: i as u64 * 1_000_000 / FPS as u64,
+                })
+                .unwrap();
+        }
+        drop(frame_tx); // 结束视频输入
+
+        // 注入 1 秒的音频 AAC 包（47 包 * 1024 采样 ≈ 1 秒 @ 48kHz）
+        for i in 0..47 {
+            let pts_us = (i as u64 * 1024 * 1_000_000) / 48_000;
+            mux_tx
+                .send(MuxMsg::Audio(AacPacket {
+                    data: vec![0x21; 120],
+                    pts_us,
+                }))
+                .unwrap();
+        }
+        drop(mux_tx); // 结束音频输入并关闭 mux 通道
+
+        encode.join().unwrap();
+        mux.join().unwrap();
+
+        assert!(
+            !env.fatal.load(Ordering::Relaxed),
+            "流水线报致命错误: {:?}",
+            env.last_error.lock().unwrap()
+        );
+
+        let bytes = std::fs::read(&path).expect("产物文件必须存在");
+        assert!(bytes.len() > 1024, "文件过小: {} 字节", bytes.len());
+
+        let mut types: Vec<(Vec<u8>, usize)> = Vec::new();
+        let mut pos = 0usize;
+        while pos + 8 <= bytes.len() {
+            let size =
+                u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]);
+            let size = match size {
+                0 => bytes.len() - pos,
+                1 => u64::from_be_bytes(bytes[pos + 8..pos + 16].try_into().unwrap()) as usize,
+                n => n as usize,
+            };
+            assert!(size >= 8, "盒大小非法: {size} @ {pos}");
+            types.push((bytes[pos + 4..pos + 8].to_vec(), pos));
+            pos += size;
+        }
+        assert_eq!(pos, bytes.len(), "顶层盒序列必须恰好覆盖整个文件");
+        let kinds: Vec<&[u8]> = types.iter().map(|(k, _)| k.as_slice()).collect();
+        assert_eq!(
+            kinds,
+            vec![b"ftyp".as_slice(), b"mdat".as_slice(), b"moov".as_slice()],
+            "Hybrid 成品顶层应只有 ftyp/mdat/moov，实际 {kinds:?}"
+        );
+
+        let moov_start = types.last().unwrap().1;
+        let moov = &bytes[moov_start..];
+        assert!(moov.windows(4).any(|w| w == b"avc1"), "moov 缺少 avc1");
+        assert!(moov.windows(4).any(|w| w == b"avcC"), "moov 缺少 avcC");
+        assert!(moov.windows(4).any(|w| w == b"mp4a"), "moov 缺少 mp4a");
+        assert!(moov.windows(4).any(|w| w == b"esds"), "moov 缺少 esds");
+
+        let trak_count = moov.windows(4).filter(|w| *w == b"trak").count();
+        assert_eq!(trak_count, 2, "moov 应包含两条 trak（视频和音频）");
+    }
+
+    #[test]
+    fn pipeline_encodes_synthetic_video_and_audio_with_custom_128kbps_rate() {
+        const W: u32 = 320;
+        const H: u32 = 240;
+        const FPS: u32 = 15;
+        const KBPS: u32 = 800;
+        const FRAMES: u32 = 5;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dual_track_128k.mp4");
+
+        let env = PipelineEnv {
+            stop: Arc::new(AtomicBool::new(false)),
+            fatal: Arc::new(AtomicBool::new(false)),
+            last_error: Arc::new(Mutex::new(None)),
+            fatal_root: Arc::new(Mutex::new(None)),
+            stats: Arc::new(StatsSampler::new(ENCODER_SOFT_OPENH264)),
+        };
+
+        let (frame_tx, frame_rx) = sync_channel::<VideoFrame>(FRAME_RING_DEPTH);
+        let (mux_tx, mux_rx) = sync_channel::<MuxMsg>(PACKET_QUEUE_DEPTH);
+
+        let encode_env = env.clone();
+        let encode_mux_tx = mux_tx.clone();
+        let encode = std::thread::spawn(move || {
+            encode_thread(frame_rx, encode_mux_tx, W, H, FPS, KBPS, encode_env)
+        });
+        let mux_env = env.clone();
+        let mux_path = path.clone();
+        let mux =
+            std::thread::spawn(move || mux_thread(mux_path, W, H, FPS, Some(128), mux_rx, mux_env));
+
+        let stride = W * 4;
+        for i in 0..FRAMES {
+            let bgra = vec![0x20u8; (stride * H) as usize];
+            frame_tx
+                .send(VideoFrame {
+                    bgra: bgra.into(),
+                    stride,
+                    width: W,
+                    height: H,
+                    pts_us: i as u64 * 1_000_000 / FPS as u64,
+                })
+                .unwrap();
+        }
+        drop(frame_tx);
+
+        for i in 0..15 {
+            let pts_us = (i as u64 * 1024 * 1_000_000) / 48_000;
+            mux_tx
+                .send(MuxMsg::Audio(AacPacket {
+                    data: vec![0x21; 80],
+                    pts_us,
+                }))
+                .unwrap();
+        }
+        drop(mux_tx);
+
+        encode.join().unwrap();
+        mux.join().unwrap();
+
+        let bytes = std::fs::read(&path).expect("产物文件必须存在");
+        assert!(bytes.len() > 1024);
+
+        let esds_pos = bytes
+            .windows(4)
+            .position(|w| w == b"esds")
+            .expect("moov 缺少 esds");
+        let esds_box = &bytes[esds_pos - 4..];
+        // maxBitrate 在 esds_box[27..31]
+        assert_eq!(
+            &esds_box[27..31],
+            &128_000u32.to_be_bytes(),
+            "esds maxBitrate 应为 128000"
+        );
+        assert_eq!(
+            &esds_box[31..35],
+            &128_000u32.to_be_bytes(),
+            "esds avgBitrate 应为 128000"
+        );
     }
 }

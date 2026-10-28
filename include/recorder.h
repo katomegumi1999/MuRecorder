@@ -1,7 +1,7 @@
 /* recorder.h — MuRecorder C ABI（由 cbindgen 生成的手工对照版，字段以本文件为准）
  *
  * 消费者：ShawMuOCR (C# / Avalonia)，通过 [LibraryImport] 绑定。
- * 生产者：recorder_core.dll (Rust cdylib)。
+ * 生产者：murecorder_core.dll (Rust cdylib)。
  *
  * ABI 约束（评审清单，任何改动必须同步本节）：
  *   1. recorder_create 只分配、不启动；线程在 recorder_start 中创建。
@@ -9,7 +9,10 @@
  *   3. 所有导出函数用 catch_unwind 包裹，panic 转为 REC_ERR_PANIC，
  *      绝不让 panic 展开到 C# 宿主进程。
  *   4. 字符串参数 Rust 只读、不持有，调用返回后 C# 可立即释放。
- *   5. 结构体首字段固定为 abi_version，后续新增字段只能尾部追加。
+ *   5. 结构体首字段固定为 abi_version，新增字段只能尾部追加，**并且必须同时
+ *      递增 RECORDER_ABI_VERSION**。原因：ABI 的契约是「已编译的旧宿主能继续
+ *      安全调用新 dll」，而不只是「宿主和库一起重编译时对得上」。旧宿主的结构体
+ *      短一截，读尾部字段就是越界读（UB）；宁可让它拿到一句明确的版本不匹配。
  *   6. extern "C"，Windows x64 下即统一 ABI（Microsoft x64 ABI）。
  *   7. 句柄内部是 Mutex<Recorder>：可从任意线程并发调用（UI 线程轮询 stats 的同时
  *      另一线程 stop 是合法用法）。stop 会阻塞到索引写盘完成，拿锁期间 stats 会等待。
@@ -19,7 +22,13 @@
 
 #include <stdint.h>
 
-#define RECORDER_ABI_VERSION 1
+/* 变更记录：
+ *   v1 —— 首版。
+ *   v2 —— RecorderConfig 尾部追加 audio_bitrate_kbps。
+ *         旧宿主（编进 v1 的结构体）会被明确拒绝（REC_ERR_INVALID），
+ *         不会越界读，也不会静默拿到错码率。宿主升级只需把 AbiVersion 改成 2。
+ */
+#define RECORDER_ABI_VERSION 2
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,6 +66,7 @@ typedef struct {
     const char* audio_device_id; /* UTF-8，可空；AUDIO_DEVICE 时必填 */
     uint64_t audio_window_hwnd;  /* AUDIO_WINDOW 时使用 */
     uint32_t audio_process_id;   /* AUDIO_WINDOW 时使用（0 表示仅按 HWND 解析） */
+    uint32_t audio_bitrate_kbps; /* 音频码率（kbps），0 表示默认（320 kbps），支持 96/128/160/192/256/320 */
 } RecorderConfig;
 
 typedef struct {

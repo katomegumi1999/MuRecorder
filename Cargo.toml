@@ -11,7 +11,7 @@ keywords = ["screen-recording", "dxgi", "media-foundation", "mp4", "video"]
 categories = ["multimedia::video", "os::windows-apis"]
 
 [lib]
-name = "recorder_core"
+name = "murecorder_core"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
@@ -40,6 +40,11 @@ windows = { version = "0.62", features = [
     # CreateWaitableTimerExW 的签名带 SECURITY_ATTRIBUTES，被 Win32_Security 门控；
     # 用于高精度帧率配速（CREATE_WAITABLE_TIMER_HIGH_RESOLUTION）。
     "Win32_Security",
+    # WASAPI loopback 采集与音频设备枚举
+    "Win32_Media_Audio",
+    # GetWindowThreadProcessId：AUDIO_WINDOW 音源只给了 HWND 时用来反查 PID
+    # （进程环回 API 要的是 PID，不是窗口句柄）。
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # `#[implement(...)]` 宏展开后用的是 `::windows_core::` **绝对路径**，所以除了
 # `windows` 之外必须把 `windows-core` 也作为直接依赖引入（版本要与 windows 一致，

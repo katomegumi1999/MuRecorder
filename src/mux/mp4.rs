@@ -56,11 +56,19 @@ const MAX_FRAGMENT_SECONDS: u32 = 10;
 /// 已落盘样本的元数据（末尾 moov 的 stbl 用）。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SampleRec {
-    /// 样本字节数（长度前缀后的 NAL 序列）
+    /// 样本字节数（长度前缀后的 NAL 序列或裸 AAC 帧）
     pub(crate) size: u32,
-    /// PTS（微秒，timescale = 1_000_000）
-    pub(crate) pts_us: u64,
+    /// 时间戳（本轨 timescale 的 tick）
+    pub(crate) tick: u64,
     pub(crate) is_key: bool,
+}
+
+impl SampleRec {
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn pts_us(&self) -> u64 {
+        self.tick
+    }
 }
 
 /// 一个 chunk（本实现里 = 一个分片）的元数据（末尾 moov 的 stsc/co64 用）。
@@ -74,8 +82,52 @@ pub(crate) struct ChunkRec {
 /// 待落盘的样本（分片闭合时才写 moof，因为 trun 需要每个样本的 duration）。
 struct PendingSample {
     data: Vec<u8>,
-    pts_us: u64,
+    tick: u64,
     is_key: bool,
+}
+
+/// AAC-LC 48000 Hz 立体声的 AudioSpecificConfig 常量（audioObjectType=2, freqIndex=3, channelConfig=2）。
+pub const ASC_48K_STEREO: [u8; 2] = [0x11, 0x90];
+
+/// 轨道类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackKind {
+    Video { width: u32, height: u32 },
+    Audio { channels: u16, sample_rate: u32 },
+}
+
+/// 轨道规格。
+#[derive(Debug, Clone)]
+pub struct TrackSpec {
+    pub track_id: u32,
+    pub kind: TrackKind,
+    pub timescale: u32,
+    pub desc: Option<SampleDescription>,
+}
+
+struct TrackState {
+    spec: TrackSpec,
+    samples: Vec<SampleRec>,
+    chunks: Vec<ChunkRec>,
+    pending: Vec<PendingSample>,
+}
+
+impl TrackState {
+    fn pending_duration_ticks(&self) -> u64 {
+        if self.pending.is_empty() {
+            0
+        } else {
+            let first = self.pending.first().unwrap().tick;
+            let last = self.pending.last().unwrap().tick;
+            let nominal = match self.spec.kind {
+                TrackKind::Video { .. } => 0,
+                TrackKind::Audio { .. } => 1024,
+            };
+            (last + nominal)
+                .saturating_sub(first)
+                .max(self.pending.len() as u64 * nominal)
+        }
+    }
 }
 
 /// 样本描述：`stsd` 里那个 sample entry。**与编码器无关**。
@@ -84,9 +136,9 @@ struct PendingSample {
 /// 因为 MF 只吐 Annex B 码流，参数集怎么装进 `avcC`/`hvcC` 得我们决定。
 #[derive(Debug, Clone)]
 pub struct SampleDescription {
-    /// sample entry 四字类型：`avc1` / `hvc1` / `hev1` / `av01`
+    /// sample entry 四字类型：`avc1` / `hvc1` / `hev1` / `av01` / `mp4a`
     pub entry: [u8; 4],
-    /// 配置盒（**含盒头**，如 `avcC` / `hvcC` / `av1C`）
+    /// 配置盒（**含盒头**，如 `avcC` / `hvcC` / `av1C` / `esds`）
     pub config_boxes: Vec<Vec<u8>>,
     /// 写入 compressor name 的显示名（纯装饰）
     pub label: String,
@@ -94,24 +146,17 @@ pub struct SampleDescription {
 
 pub struct Mp4Muxer {
     file: File,
-    width: u32,
-    height: u32,
     fps: u32,
     /// ftyp 长度，也是 free/mdat 占位区的起始偏移
     ftyp_len: u64,
-    samples: Vec<SampleRec>,
-    chunks: Vec<ChunkRec>,
-    /// 当前未闭合分片的样本
-    pending: Vec<PendingSample>,
+    tracks: Vec<TrackState>,
     /// mfhd 序列号
     seq: u32,
     /// 首个关键帧的 SPS/PPS（avcC 用）
     sps: Vec<u8>,
     pps: Vec<u8>,
-    /// init moov 是否已写（要等第一个关键帧拿到 SPS/PPS）
+    /// init moov 是否已写（要等视频 desc SPS/PPS 到齐）
     header_written: bool,
-    /// 外部给的样本描述。`None` = 沿用「从 SPS/PPS 现场构 avcC」的软编老路。
-    desc: Option<SampleDescription>,
     finished: bool,
 }
 
@@ -133,39 +178,105 @@ pub(crate) fn build_mdat_header(total_len: u64) -> [u8; MDAT_HEADER_LEN as usize
 }
 
 impl Mp4Muxer {
-    /// 创建文件并写入 `ftyp` + `free(16B)`。
+    /// 创建多轨文件并写入 `ftyp` + `free(16B)`。
     ///
-    /// init moov 要等第一个关键帧拿到 SPS/PPS 才能写，所以这里只铺好前两个盒。
-    pub fn create(path: &Path, width: u32, height: u32, fps: u32) -> io::Result<Self> {
-        let mut file = File::create(path)?;
+    /// 音轨 desc 先注册（ASC 是常量，构造时即知），视频 desc 等首帧关键帧（或由 `set_video_description` 设置）。
+    pub fn create_multi(
+        path: &Path,
+        video: Option<(u32, u32, u32)>, // (w, h, fps)；None = 纯音频（保留给测试）
+        audio: Option<(u16, u32)>,      // (channels, sample_rate)
+    ) -> io::Result<Self> {
+        Self::create_multi_with_audio_bitrate(path, video, audio, 320_000)
+    }
 
+    /// 创建带指定音频码率的多轨 MP4 封装器。
+    pub fn create_multi_with_audio_bitrate(
+        path: &Path,
+        video: Option<(u32, u32, u32)>,
+        audio: Option<(u16, u32)>,
+        audio_bitrate_bps: u32,
+    ) -> io::Result<Self> {
+        if video.is_none() && audio.is_none() {
+            return Err(io::Error::other("至少需要一条轨道（视频或音频）"));
+        }
+
+        let mut file = File::create(path)?;
         let ftyp = build_ftyp();
         let ftyp_len = ftyp.len() as u64;
         file.write_all(&ftyp)?;
         file.write_all(&build_free_placeholder())?;
 
-        Ok(Self {
+        let mut tracks = Vec::new();
+        let mut fps = 30;
+
+        if let Some((w, h, v_fps)) = video {
+            fps = v_fps.max(1);
+            tracks.push(TrackState {
+                spec: TrackSpec {
+                    track_id: 1,
+                    kind: TrackKind::Video {
+                        width: w,
+                        height: h,
+                    },
+                    timescale: 1_000_000,
+                    desc: None,
+                },
+                samples: Vec::new(),
+                chunks: Vec::new(),
+                pending: Vec::new(),
+            });
+        }
+
+        if let Some((channels, sample_rate)) = audio {
+            let esds = build_esds(&ASC_48K_STEREO, audio_bitrate_bps);
+            tracks.push(TrackState {
+                spec: TrackSpec {
+                    track_id: 2,
+                    kind: TrackKind::Audio {
+                        channels,
+                        sample_rate,
+                    },
+                    timescale: sample_rate,
+                    desc: Some(SampleDescription {
+                        entry: *b"mp4a",
+                        config_boxes: vec![esds],
+                        label: String::new(),
+                    }),
+                },
+                samples: Vec::new(),
+                chunks: Vec::new(),
+                pending: Vec::new(),
+            });
+        }
+
+        let mut muxer = Self {
             file,
-            width,
-            height,
-            fps: fps.max(1),
+            fps,
             ftyp_len,
-            samples: Vec::new(),
-            chunks: Vec::new(),
-            pending: Vec::new(),
+            tracks,
             seq: 0,
             sps: Vec::new(),
             pps: Vec::new(),
             header_written: false,
-            desc: None,
             finished: false,
-        })
+        };
+
+        // 纯音频场景：描述在构造时已齐备，立刻写 init moov
+        if video.is_none() && audio.is_some() {
+            let init = muxer.build_init_moov()?;
+            muxer.file.write_all(&init)?;
+            muxer.header_written = true;
+        }
+
+        Ok(muxer)
     }
 
-    /// 创建文件并**立刻**写 init moov——样本描述由调用方给定，不必等关键帧。
-    ///
-    /// 硬件编码路径走这条：参数集在 `SetInputMediaType` 阶段就从
-    /// `MF_MT_MPEG_SEQUENCE_HEADER` 拿到了，没有「等第一个关键帧」的理由。
+    /// 单视频轨创建（向后兼容封装）。
+    pub fn create(path: &Path, width: u32, height: u32, fps: u32) -> io::Result<Self> {
+        Self::create_multi(path, Some((width, height, fps)), None)
+    }
+
+    /// 创建带视频描述的文件并**立刻**写 init moov。
     pub fn create_with_description(
         path: &Path,
         width: u32,
@@ -174,50 +285,131 @@ impl Mp4Muxer {
         desc: SampleDescription,
     ) -> io::Result<Self> {
         let mut muxer = Self::create(path, width, height, fps)?;
-        muxer.desc = Some(desc);
-        let init = muxer.build_init_moov()?;
-        muxer.file.write_all(&init)?;
-        muxer.header_written = true;
+        muxer.set_video_description(desc)?;
         Ok(muxer)
     }
 
-    /// 写入一个**已经是长度前缀**的样本（`stsd` 已由 [`Self::create_with_description`] 定好）。
-    pub fn write_prefixed_sample(
-        &mut self,
-        data: &[u8],
-        pts_us: u64,
-        is_key: bool,
-    ) -> io::Result<()> {
+    /// 设置视频轨的 SampleDescription，并触发 init moov 写入（若尚未写出）。
+    pub fn set_video_description(&mut self, desc: SampleDescription) -> io::Result<()> {
+        let idx = self
+            .video_track_idx()
+            .ok_or_else(|| io::Error::other("未配置视频轨"))?;
+        self.tracks[idx].spec.desc = Some(desc);
+        if !self.header_written {
+            let init = self.build_init_moov()?;
+            self.file.write_all(&init)?;
+            self.header_written = true;
+        }
+        Ok(())
+    }
+
+    fn video_track_idx(&self) -> Option<usize> {
+        self.tracks
+            .iter()
+            .position(|t| matches!(t.spec.kind, TrackKind::Video { .. }))
+    }
+
+    fn audio_track_idx(&self) -> Option<usize> {
+        self.tracks
+            .iter()
+            .position(|t| matches!(t.spec.kind, TrackKind::Audio { .. }))
+    }
+
+    /// 写入视频样本（timescale = 1_000_000）。
+    pub fn write_video_sample(&mut self, data: &[u8], pts_us: u64, is_key: bool) -> io::Result<()> {
         if self.finished {
             return Err(io::Error::other("muxer已结束，不能继续写样本"));
         }
         if data.is_empty() {
             return Ok(());
         }
+        let idx = self
+            .video_track_idx()
+            .ok_or_else(|| io::Error::other("未配置视频轨"))?;
+
         if !self.header_written {
-            let init = self.build_init_moov()?;
-            self.file.write_all(&init)?;
-            self.header_written = true;
+            if self.tracks[idx].spec.desc.is_some() {
+                let init = self.build_init_moov()?;
+                self.file.write_all(&init)?;
+                self.header_written = true;
+            } else {
+                return Err(io::Error::other("init moov 未写入，缺少视频样本描述"));
+            }
         }
-        if is_key && !self.pending.is_empty() {
-            self.flush_fragment()?;
+
+        if is_key && !self.tracks[idx].pending.is_empty() {
+            self.flush_fragment_for_track(idx)?;
         }
-        self.pending.push(PendingSample {
+
+        self.tracks[idx].pending.push(PendingSample {
             data: data.to_vec(),
-            pts_us,
+            tick: pts_us,
             is_key,
         });
+
         let max_samples = self.max_fragment_samples();
-        if self.pending.len() >= max_samples {
-            self.flush_fragment()?;
+        if self.tracks[idx].pending.len() >= max_samples {
+            self.flush_fragment_for_track(idx)?;
         }
         Ok(())
     }
 
-    /// 写入一个已编码样本（长度前缀 NAL 序列）。`pts_us` 为微秒 PTS。
-    ///
-    /// 关键帧会闭合上一个分片；`MAX_FRAGMENT_SECONDS` 内仍无关键帧时强制闭合。
-    /// 在拿到首个关键帧（含 SPS/PPS）之前，样本会被丢弃——没有参数集就写不出 init moov。
+    /// 写入音频样本（timescale = 48_000）。
+    pub fn write_audio_sample(&mut self, data: &[u8], pts_ticks: u64) -> io::Result<()> {
+        if self.finished {
+            return Err(io::Error::other("muxer已结束，不能继续写样本"));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let idx = self
+            .audio_track_idx()
+            .ok_or_else(|| io::Error::other("未配置音频轨"))?;
+
+        // init moov 还没落盘时，音频只能先攒在内存里。这段时间的上界必须显式管住：
+        //   1. 音频线程和视频线程是并发的，音频通常先到；
+        //   2. 如果视频首个关键帧迟迟不来（画面一直静止、DXGI 只交付了一帧、
+        //      或编码器卡住），`pending` 就会无限增长——每包 ~1 KB 看着不多，
+        //      一小时就是几百 MB，而且完全是白占。
+        // 超过 2 秒的积压就丢**最旧**的包：内存有界，录制不中断。
+        // 时间轴由 `stts` 按真实 tick 计算，丢掉的部分自然成为静音空档，
+        // 不会让后续样本的时间戳发生偏移。
+        const MAX_PENDING_AUDIO_PACKETS: usize = 94; // 2 s @ 48 kHz / 1024
+        if self.tracks[idx].pending.len() >= MAX_PENDING_AUDIO_PACKETS {
+            self.tracks[idx].pending.remove(0);
+            eprintln!(
+                "[murec] 音频：init moov 尚未落盘，音频积压超过 2 秒，丢弃最旧的包（不影响其余样本时间戳）"
+            );
+        }
+
+        self.tracks[idx].pending.push(PendingSample {
+            data: data.to_vec(),
+            tick: pts_ticks,
+            is_key: true,
+        });
+
+        // 仅在 init moov 已落盘后才落盘音频分片
+        if self.header_written {
+            let pending_ticks = self.tracks[idx].pending_duration_ticks();
+            if pending_ticks >= 24_000 {
+                // 500 ms @ 48kHz
+                self.flush_fragment_for_track(idx)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 写入带长度前缀的视频样本（向后兼容封装）。
+    pub fn write_prefixed_sample(
+        &mut self,
+        data: &[u8],
+        pts_us: u64,
+        is_key: bool,
+    ) -> io::Result<()> {
+        self.write_video_sample(data, pts_us, is_key)
+    }
+
+    /// 写入视频样本（带 SPS/PPS，首个关键帧时构建 avcC 并写 init moov）。
     pub fn write_sample(
         &mut self,
         data: &[u8],
@@ -238,40 +430,30 @@ impl Mp4Muxer {
 
         if !self.header_written {
             if !is_key || self.sps.is_empty() || self.pps.is_empty() {
-                // 必须等到关键帧：init moov 的 avcC 需要真实 SPS/PPS。
                 return Ok(());
             }
-            let init = self.build_init_moov()?;
-            self.file.write_all(&init)?;
-            self.header_written = true;
+            let avcc = build_avcc(&self.sps, &self.pps)?;
+            self.set_video_description(SampleDescription {
+                entry: *b"avc1",
+                config_boxes: vec![avcc],
+                label: "MuRecorder H.264".to_string(),
+            })?;
         }
 
-        // 新关键帧 → 上一个分片到此为止。
-        if is_key && !self.pending.is_empty() {
-            self.flush_fragment()?;
-        }
-
-        self.pending.push(PendingSample {
-            data: data.to_vec(),
-            pts_us,
-            is_key,
-        });
-
-        let max_samples = self.max_fragment_samples();
-        if self.pending.len() >= max_samples {
-            self.flush_fragment()?;
-        }
-        Ok(())
+        self.write_video_sample(data, pts_us, is_key)
     }
 
     /// 已写入的样本数（统计/测试用）。
     pub fn sample_count(&self) -> usize {
-        self.samples.len() + self.pending.len()
+        self.tracks
+            .iter()
+            .map(|t| t.samples.len() + t.pending.len())
+            .sum()
     }
 
     /// 已落盘的分片数（测试用）。
     pub fn fragment_count(&self) -> usize {
-        self.chunks.len()
+        self.tracks.iter().map(|t| t.chunks.len()).sum()
     }
 
     /// 单个分片的样本数上限。
@@ -286,24 +468,28 @@ impl Mp4Muxer {
         (1_000_000 / self.fps.max(1) as u64).max(1) as u32
     }
 
-    /// 把当前 pending 样本落成一个 `moof` + `mdat`。
-    fn flush_fragment(&mut self) -> io::Result<()> {
-        if self.pending.is_empty() {
+    /// 把指定轨当前 pending 样本落成一个 `moof` + `mdat`。
+    fn flush_fragment_for_track(&mut self, track_idx: usize) -> io::Result<()> {
+        if self.tracks[track_idx].pending.is_empty() {
             return Ok(());
         }
         if !self.header_written {
             return Err(io::Error::other("init moov 未写入，不能落盘分片"));
         }
 
-        let pending = std::mem::take(&mut self.pending);
-        let nominal = self.nominal_interval();
+        let pending = std::mem::take(&mut self.tracks[track_idx].pending);
+        let track_id = self.tracks[track_idx].spec.track_id;
+        let nominal = match self.tracks[track_idx].spec.kind {
+            TrackKind::Video { .. } => self.nominal_interval(),
+            TrackKind::Audio { .. } => 1024,
+        };
 
         // trun 的 data_offset 相对 moof 起点（tfhd flags 0x020000 = default-base-is-moof），
         // 而它本身占 4 字节定长 → 可以先量一次 moof 长度再回填。
-        let probe = self.build_moof(self.seq, 0, &pending, nominal);
+        let probe = self.build_moof(self.seq, track_id, 0, &pending, nominal);
         let moof_len = probe.len() as u64;
         let data_offset_rel = (moof_len + FRAG_MDAT_HEADER_LEN) as i32;
-        let moof = self.build_moof(self.seq, data_offset_rel, &pending, nominal);
+        let moof = self.build_moof(self.seq, track_id, data_offset_rel, &pending, nominal);
         debug_assert_eq!(
             moof.len() as u64,
             moof_len,
@@ -323,26 +509,29 @@ impl Mp4Muxer {
         self.file.write_all(&(mdat_size as u32).to_be_bytes())?;
         self.file.write_all(b"mdat")?;
 
-        let sample_start = self.samples.len();
+        let sample_start = self.tracks[track_idx].samples.len();
         for p in &pending {
             self.file.write_all(&p.data)?;
-            self.samples.push(SampleRec {
+            self.tracks[track_idx].samples.push(SampleRec {
                 size: p.data.len() as u32,
-                pts_us: p.pts_us,
+                tick: p.tick,
                 is_key: p.is_key,
             });
         }
 
-        self.chunks.push(ChunkRec {
+        self.tracks[track_idx].chunks.push(ChunkRec {
             data_offset: moof_offset + moof_len + FRAG_MDAT_HEADER_LEN,
             sample_count: pending.len(),
         });
-        debug_assert_eq!(self.samples.len(), sample_start + pending.len());
+        debug_assert_eq!(
+            self.tracks[track_idx].samples.len(),
+            sample_start + pending.len()
+        );
         self.seq += 1;
         Ok(())
     }
 
-    /// 结束录制：落盘最后一个分片、末尾追加完整 moov、把开头 free 改写成巨型 mdat。
+    /// 结束录制：落盘所有轨道未闭合分片、末尾追加完整 moov、把开头 free 改写成巨型 mdat。
     ///
     /// 返回最终文件字节数。
     pub fn finish(mut self) -> io::Result<u64> {
@@ -351,9 +540,12 @@ impl Mp4Muxer {
         }
         self.finished = true;
 
-        self.flush_fragment()?;
+        for idx in 0..self.tracks.len() {
+            self.flush_fragment_for_track(idx)?;
+        }
 
-        if self.samples.is_empty() {
+        let total_samples: usize = self.tracks.iter().map(|t| t.samples.len()).sum();
+        if total_samples == 0 {
             self.file.flush()?;
             return Err(io::Error::other("没有样本，无法生成 moov"));
         }
@@ -378,83 +570,146 @@ impl Mp4Muxer {
 
     /// 录制中的 init moov：只含解码初始化信息 + mvex，不含任何样本表。
     fn build_init_moov(&self) -> io::Result<Vec<u8>> {
-        if self.desc.is_none() && (self.sps.is_empty() || self.pps.is_empty()) {
-            return Err(io::Error::other("缺少 SPS/PPS（未收到关键帧）"));
+        for t in &self.tracks {
+            if t.spec.desc.is_none() && (self.sps.is_empty() || self.pps.is_empty()) {
+                return Err(io::Error::other("缺少 SPS/PPS（未收到关键帧）"));
+            }
         }
 
-        let mut trak = Vec::new();
-        trak.extend_from_slice(&build_tkhd(0, self.width, self.height));
-        trak.extend_from_slice(&self.build_mdia(0, true)?);
-        let trak = build_box(b"trak", &trak);
+        let mut traks = Vec::new();
+        for track in &self.tracks {
+            let trak = self.build_trak(track, 0, true)?;
+            traks.extend_from_slice(&trak);
+        }
 
         let mut moov_payload = Vec::new();
         moov_payload.extend_from_slice(&self.build_mvhd(0));
-        moov_payload.extend_from_slice(&trak);
-        moov_payload.extend_from_slice(&build_mvex());
+        moov_payload.extend_from_slice(&traks);
+        moov_payload.extend_from_slice(&self.build_mvex());
         Ok(build_box(b"moov", &moov_payload))
     }
 
     /// 停止时的完整 moov：普通 MP4 结构，不带 mvex。
     fn build_moov(&self) -> io::Result<Vec<u8>> {
-        if self.samples.is_empty() {
-            return Err(io::Error::other("没有样本，无法生成 moov"));
-        }
-        if self.desc.is_none() && (self.sps.is_empty() || self.pps.is_empty()) {
-            return Err(io::Error::other("缺少 SPS/PPS（未收到关键帧）"));
-        }
+        let (video_dur_ms, audio_dur_ms) = self.calculate_track_durations_ms();
+        let mvhd_duration_ms = video_dur_ms.max(audio_dur_ms);
 
-        let duration_us = self.samples.last().unwrap().pts_us + self.nominal_interval() as u64;
-
-        let mut trak = Vec::new();
-        trak.extend_from_slice(&build_tkhd(duration_us, self.width, self.height));
-        trak.extend_from_slice(&self.build_mdia(duration_us, false)?);
-        let trak = build_box(b"trak", &trak);
+        let mut traks = Vec::new();
+        for track in &self.tracks {
+            let dur_ms = match track.spec.kind {
+                TrackKind::Video { .. } => video_dur_ms,
+                TrackKind::Audio { .. } => audio_dur_ms,
+            };
+            let trak = self.build_trak(track, dur_ms, false)?;
+            traks.extend_from_slice(&trak);
+        }
 
         let mut moov_payload = Vec::new();
-        moov_payload.extend_from_slice(&self.build_mvhd(duration_us));
-        moov_payload.extend_from_slice(&trak);
+        moov_payload.extend_from_slice(&self.build_mvhd(mvhd_duration_ms));
+        moov_payload.extend_from_slice(&traks);
         Ok(build_box(b"moov", &moov_payload))
     }
 
+    fn calculate_track_durations_ms(&self) -> (u64, u64) {
+        let mut video_dur_ms = 0u64;
+        let mut audio_dur_ms = 0u64;
+        for t in &self.tracks {
+            match t.spec.kind {
+                TrackKind::Video { .. } => {
+                    if let Some(last) = t.samples.last() {
+                        let dur_us = last.tick + self.nominal_interval() as u64;
+                        video_dur_ms = dur_us / 1000;
+                    }
+                }
+                TrackKind::Audio { .. } => {
+                    if !t.samples.is_empty() {
+                        let ticks = t.samples.len() as u64 * 1024;
+                        audio_dur_ms = (ticks as u128 * 1000 / t.spec.timescale as u128) as u64;
+                    }
+                }
+            }
+        }
+        (video_dur_ms, audio_dur_ms)
+    }
+
+    fn build_trak(&self, track: &TrackState, duration_ms: u64, init: bool) -> io::Result<Vec<u8>> {
+        let mut trak = Vec::new();
+        trak.extend_from_slice(&build_tkhd(
+            track.spec.track_id,
+            duration_ms,
+            &track.spec.kind,
+        ));
+        trak.extend_from_slice(&self.build_mdia(track, init)?);
+        Ok(build_box(b"trak", &trak))
+    }
+
     /// mvhd：timescale = 1000（毫秒）。
-    fn build_mvhd(&self, duration_us: u64) -> Vec<u8> {
+    fn build_mvhd(&self, duration_ms: u64) -> Vec<u8> {
+        let next_track_id = self
+            .tracks
+            .iter()
+            .map(|t| t.spec.track_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let next_track_id = next_track_id.max(2);
+
         let mut p = Vec::new();
         p.extend_from_slice(&0u32.to_be_bytes()); // creation_time
         p.extend_from_slice(&0u32.to_be_bytes()); // modification_time
         p.extend_from_slice(&1000u32.to_be_bytes()); // timescale (ms)
-        p.extend_from_slice(&(duration_us / 1000).to_be_bytes()); // duration
+        p.extend_from_slice(&(duration_ms as u32).to_be_bytes()); // duration
         p.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
         p.extend_from_slice(&0x0100u16.to_be_bytes()); // volume 1.0
         p.extend_from_slice(&[0u8; 10]); // reserved
         p.extend_from_slice(&UNIT_MATRIX);
         p.extend_from_slice(&[0u8; 24]); // pre_defined
-        p.extend_from_slice(&2u32.to_be_bytes()); // next_track_ID
+        p.extend_from_slice(&next_track_id.to_be_bytes()); // next_track_ID
         build_full_box(b"mvhd", 0, 0, &p)
     }
 
-    fn build_mdia(&self, duration_us: u64, init: bool) -> io::Result<Vec<u8>> {
-        // mdhd：timescale = 1_000_000（µs）。
-        // 必须用 version 1 携带 64 位 duration——v0 的 32 位时长在 µs 时基下
-        // 上限只有 4294.97 s（≈71.6 分钟），超过后时长字段回绕、进度条失效。
+    fn build_mdia(&self, track: &TrackState, init: bool) -> io::Result<Vec<u8>> {
+        let duration_ticks = if init {
+            0
+        } else {
+            match track.spec.kind {
+                TrackKind::Video { .. } => track
+                    .samples
+                    .last()
+                    .map(|s| s.tick + self.nominal_interval() as u64)
+                    .unwrap_or(0),
+                TrackKind::Audio { .. } => track.samples.len() as u64 * 1024,
+            }
+        };
+
+        // mdhd：timescale 由轨道决定（视频 1_000_000，音频 48_000）。
+        // 必须用 version 1 携带 64 位 duration。
         let mut mdhd = Vec::new();
         mdhd.extend_from_slice(&0u64.to_be_bytes()); // creation_time
         mdhd.extend_from_slice(&0u64.to_be_bytes()); // modification_time
-        mdhd.extend_from_slice(&1_000_000u32.to_be_bytes()); // timescale
-        mdhd.extend_from_slice(&duration_us.to_be_bytes()); // duration (64-bit)
+        mdhd.extend_from_slice(&track.spec.timescale.to_be_bytes()); // timescale
+        mdhd.extend_from_slice(&duration_ticks.to_be_bytes()); // duration (64-bit)
         mdhd.extend_from_slice(&0x55C4u16.to_be_bytes()); // language "und"
         mdhd.extend_from_slice(&[0u8; 2]);
         let mdhd = build_full_box(b"mdhd", 1, 0, &mdhd);
 
-        // hdlr：vide
+        // hdlr：vide 或 soun
+        let handler_type = match track.spec.kind {
+            TrackKind::Video { .. } => b"vide",
+            TrackKind::Audio { .. } => b"soun",
+        };
         let mut hdlr = Vec::new();
         hdlr.extend_from_slice(&0u32.to_be_bytes()); // pre_defined
-        hdlr.extend_from_slice(b"vide");
+        hdlr.extend_from_slice(handler_type);
         hdlr.extend_from_slice(&[0u8; 12]); // reserved
         hdlr.push(0); // name: 空 C 字符串
         let hdlr = build_full_box(b"hdlr", 0, 0, &hdlr);
 
-        // vmhd
-        let vmhd = build_full_box(b"vmhd", 0, 1, &[0u8; 8]);
+        // minf 头盒：vmhd 或 smhd
+        let mhd = match track.spec.kind {
+            TrackKind::Video { .. } => build_full_box(b"vmhd", 0, 1, &[0u8; 8]),
+            TrackKind::Audio { .. } => build_full_box(b"smhd", 0, 0, &[0u8; 4]),
+        };
 
         // dinf → dref → url
         let url = build_full_box(b"url ", 0, 1, &[]);
@@ -465,13 +720,13 @@ impl Mp4Muxer {
         let dinf = build_box(b"dinf", &dref);
 
         let stbl = if init {
-            self.build_stbl_init()?
+            self.build_stbl_init(track)?
         } else {
-            self.build_stbl_full()?
+            self.build_stbl_full(track)?
         };
 
         let mut minf_payload = Vec::new();
-        minf_payload.extend_from_slice(&vmhd);
+        minf_payload.extend_from_slice(&mhd);
         minf_payload.extend_from_slice(&dinf);
         minf_payload.extend_from_slice(&stbl);
         let minf = build_box(b"minf", &minf_payload);
@@ -483,25 +738,32 @@ impl Mp4Muxer {
         Ok(build_box(b"mdia", &mdia_payload))
     }
 
-    /// stsd（avc1 + avcC + colr）：init moov 与完整 moov 都需要。
-    fn build_stsd(&self) -> io::Result<Vec<u8>> {
-        let entry = match &self.desc {
-            Some(d) => build_visual_sample_entry(
-                &d.entry,
-                &d.label,
-                self.width,
-                self.height,
-                &d.config_boxes,
-            ),
+    /// stsd：init moov 与完整 moov 都需要。
+    fn build_stsd(&self, track: &TrackState) -> io::Result<Vec<u8>> {
+        let entry = match &track.spec.desc {
+            Some(d) => match track.spec.kind {
+                TrackKind::Video { width, height } => {
+                    build_visual_sample_entry(&d.entry, &d.label, width, height, &d.config_boxes)
+                }
+                TrackKind::Audio {
+                    channels,
+                    sample_rate,
+                } => build_audio_sample_entry(&d.entry, channels, sample_rate, &d.config_boxes),
+            },
             None => {
                 let avcc = build_avcc(&self.sps, &self.pps)?;
-                build_visual_sample_entry(
-                    b"avc1",
-                    "MuRecorder H.264",
-                    self.width,
-                    self.height,
-                    &[avcc],
-                )
+                match track.spec.kind {
+                    TrackKind::Video { width, height } => build_visual_sample_entry(
+                        b"avc1",
+                        "MuRecorder H.264",
+                        width,
+                        height,
+                        &[avcc],
+                    ),
+                    TrackKind::Audio { .. } => {
+                        return Err(io::Error::other("音频轨缺少 SampleDescription"));
+                    }
+                }
             }
         };
         let mut payload = Vec::new();
@@ -511,42 +773,62 @@ impl Mp4Muxer {
     }
 
     /// init moov 的 stbl：只有 stsd，样本表由各 moof 提供。
-    fn build_stbl_init(&self) -> io::Result<Vec<u8>> {
-        Ok(build_box(b"stbl", &self.build_stsd()?))
+    fn build_stbl_init(&self, track: &TrackState) -> io::Result<Vec<u8>> {
+        Ok(build_box(b"stbl", &self.build_stsd(track)?))
     }
 
-    /// 完整 moov 的 stbl：stsd + stts + stss + stsc + stsz + co64。
-    fn build_stbl_full(&self) -> io::Result<Vec<u8>> {
-        let stsd = self.build_stsd()?;
+    /// 完整 moov 的 stbl：stsd + stts + (stss) + stsc + stsz + co64。
+    fn build_stbl_full(&self, track: &TrackState) -> io::Result<Vec<u8>> {
+        let stsd = self.build_stsd(track)?;
 
-        // stts：run-length (count, delta)
-        let entries = build_stts_entries(&self.samples, self.fps);
-        let mut stts_payload = Vec::new();
-        stts_payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
-        for (count, delta) in &entries {
-            stts_payload.extend_from_slice(&count.to_be_bytes());
-            stts_payload.extend_from_slice(&delta.to_be_bytes());
-        }
-        let stts = build_full_box(b"stts", 0, 0, &stts_payload);
+        // stts
+        let stts = match track.spec.kind {
+            TrackKind::Video { .. } => {
+                let entries = build_stts_entries(&track.samples, self.nominal_interval());
+                let mut stts_payload = Vec::new();
+                stts_payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+                for (count, delta) in &entries {
+                    stts_payload.extend_from_slice(&count.to_be_bytes());
+                    stts_payload.extend_from_slice(&delta.to_be_bytes());
+                }
+                build_full_box(b"stts", 0, 0, &stts_payload)
+            }
+            TrackKind::Audio { .. } => {
+                let mut stts_payload = Vec::new();
+                if track.samples.is_empty() {
+                    stts_payload.extend_from_slice(&0u32.to_be_bytes());
+                } else {
+                    stts_payload.extend_from_slice(&1u32.to_be_bytes()); // 1 entry
+                    stts_payload.extend_from_slice(&(track.samples.len() as u32).to_be_bytes());
+                    stts_payload.extend_from_slice(&1024u32.to_be_bytes()); // AAC 每帧 1024 采样
+                }
+                build_full_box(b"stts", 0, 0, &stts_payload)
+            }
+        };
 
-        // stss：关键帧样本号（1-based）
-        let keys: Vec<u32> = self
-            .samples
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.is_key)
-            .map(|(i, _)| (i + 1) as u32)
-            .collect();
-        let mut stss_payload = Vec::new();
-        stss_payload.extend_from_slice(&(keys.len() as u32).to_be_bytes());
-        for k in &keys {
-            stss_payload.extend_from_slice(&k.to_be_bytes());
-        }
-        let stss = build_full_box(b"stss", 0, 0, &stss_payload);
+        // stss：视频轨有；音频轨全为同步点，规范要求不写 stss
+        let stss_box = match track.spec.kind {
+            TrackKind::Video { .. } => {
+                let keys: Vec<u32> = track
+                    .samples
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.is_key)
+                    .map(|(i, _)| (i + 1) as u32)
+                    .collect();
+                let mut stss_payload = Vec::new();
+                stss_payload.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+                for k in &keys {
+                    stss_payload.extend_from_slice(&k.to_be_bytes());
+                }
+                Some(build_full_box(b"stss", 0, 0, &stss_payload))
+            }
+            TrackKind::Audio { .. } => None,
+        };
 
         // stsc：每个分片一个 chunk；相邻分片样本数相同时做 run-length 合并。
         let mut sc_entries: Vec<(u32, u32)> = Vec::new(); // (first_chunk, samples_per_chunk)
-        for (i, f) in self.chunks.iter().enumerate() {
+        for (i, f) in track.chunks.iter().enumerate() {
             let spc = f.sample_count as u32;
             match sc_entries.last() {
                 Some(&(_, last_spc)) if last_spc == spc => {}
@@ -554,7 +836,7 @@ impl Mp4Muxer {
             }
         }
         if sc_entries.is_empty() {
-            sc_entries.push((1, self.samples.len() as u32));
+            sc_entries.push((1, track.samples.len() as u32));
         }
         let mut stsc_payload = Vec::new();
         stsc_payload.extend_from_slice(&(sc_entries.len() as u32).to_be_bytes());
@@ -568,16 +850,16 @@ impl Mp4Muxer {
         // stsz：每样本大小
         let mut stsz_payload = Vec::new();
         stsz_payload.extend_from_slice(&0u32.to_be_bytes()); // sample_size=0 → 变长
-        stsz_payload.extend_from_slice(&(self.samples.len() as u32).to_be_bytes());
-        for s in &self.samples {
+        stsz_payload.extend_from_slice(&(track.samples.len() as u32).to_be_bytes());
+        for s in &track.samples {
             stsz_payload.extend_from_slice(&s.size.to_be_bytes());
         }
         let stsz = build_full_box(b"stsz", 0, 0, &stsz_payload);
 
         // co64：每分片一个 chunk 偏移（64 位，不受 4 GiB 限制）
         let mut co64_payload = Vec::new();
-        co64_payload.extend_from_slice(&(self.chunks.len() as u32).to_be_bytes());
-        for f in &self.chunks {
+        co64_payload.extend_from_slice(&(track.chunks.len() as u32).to_be_bytes());
+        for f in &track.chunks {
             co64_payload.extend_from_slice(&f.data_offset.to_be_bytes());
         }
         let co64 = build_full_box(b"co64", 0, 0, &co64_payload);
@@ -585,43 +867,59 @@ impl Mp4Muxer {
         let mut stbl_payload = Vec::new();
         stbl_payload.extend_from_slice(&stsd);
         stbl_payload.extend_from_slice(&stts);
-        stbl_payload.extend_from_slice(&stss);
+        if let Some(stss) = stss_box {
+            stbl_payload.extend_from_slice(&stss);
+        }
         stbl_payload.extend_from_slice(&stsc);
         stbl_payload.extend_from_slice(&stsz);
         stbl_payload.extend_from_slice(&co64);
         Ok(build_box(b"stbl", &stbl_payload))
     }
 
+    fn build_mvex(&self) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for track in &self.tracks {
+            let dur = match track.spec.kind {
+                TrackKind::Video { .. } => 0u32,
+                TrackKind::Audio { .. } => 1024u32,
+            };
+            let mut p = Vec::new();
+            p.extend_from_slice(&track.spec.track_id.to_be_bytes()); // track_ID
+            p.extend_from_slice(&1u32.to_be_bytes()); // default_sample_description_index
+            p.extend_from_slice(&dur.to_be_bytes()); // default_sample_duration
+            p.extend_from_slice(&0u32.to_be_bytes()); // default_sample_size
+            p.extend_from_slice(&0u32.to_be_bytes()); // default_sample_flags
+            let trex = build_full_box(b"trex", 0, 0, &p);
+            payload.extend_from_slice(&trex);
+        }
+        build_box(b"mvex", &payload)
+    }
+
     // ---------------------------------------------------------------- moof
 
-    /// 构建一个 `moof`。
-    ///
-    /// - `tfhd` flags = `0x020000`（default-base-is-moof）：样本位置相对 moof 起点，
-    ///   不依赖绝对文件偏移 —— 这正是「录制中随时切一段」能零修正拷贝的前提。
-    /// - `trun` flags = `0x000701`：data-offset / sample-duration / sample-size / sample-flags。
+    /// 构建一个 `moof`。每个 `moof` 只包含单条轨道的单片数据（一个 `traf`）。
     fn build_moof(
         &self,
         seq: u32,
+        track_id: u32,
         data_offset_rel: i32,
         pending: &[PendingSample],
         nominal: u32,
     ) -> Vec<u8> {
         let mfhd = build_full_box(b"mfhd", 0, 0, &seq.to_be_bytes());
 
-        let tfhd = build_full_box(b"tfhd", 0, 0x020000, &1u32.to_be_bytes());
+        let tfhd = build_full_box(b"tfhd", 0, 0x020000, &track_id.to_be_bytes());
 
-        // tfdt v1：64 位 baseMediaDecodeTime（微秒时基）
-        let base_pts = pending.first().map(|p| p.pts_us).unwrap_or(0);
-        let tfdt = build_full_box(b"tfdt", 1, 0, &base_pts.to_be_bytes());
+        // tfdt v1：64 位 baseMediaDecodeTime（本轨时基）
+        let base_tick = pending.first().map(|p| p.tick).unwrap_or(0);
+        let tfdt = build_full_box(b"tfdt", 1, 0, &base_tick.to_be_bytes());
 
         let mut trun_payload = Vec::new();
         trun_payload.extend_from_slice(&(pending.len() as u32).to_be_bytes());
         trun_payload.extend_from_slice(&data_offset_rel.to_be_bytes());
         for (i, p) in pending.iter().enumerate() {
-            // 末样本用标称帧间隔：下一个分片的首帧此刻还没到。
-            // 误差只影响该样本的显示时长（不累积到时间轴），因为 tfdt 用的都是真实 PTS。
             let duration = match pending.get(i + 1) {
-                Some(next) => (next.pts_us.saturating_sub(p.pts_us)).max(1) as u32,
+                Some(next) => (next.tick.saturating_sub(p.tick)).max(1) as u32,
                 None => nominal,
             };
             trun_payload.extend_from_slice(&duration.to_be_bytes());
@@ -688,35 +986,80 @@ pub(crate) fn build_full_box(kind: &[u8; 4], version: u8, flags: u32, payload: &
     build_box(kind, &inner)
 }
 
-/// mvex → trex：告知读取方「样本表在各 moof 里，且用上表的默认值」。
-fn build_mvex() -> Vec<u8> {
-    let mut p = Vec::new();
-    p.extend_from_slice(&1u32.to_be_bytes()); // track_ID
-    p.extend_from_slice(&1u32.to_be_bytes()); // default_sample_description_index
-    p.extend_from_slice(&0u32.to_be_bytes()); // default_sample_duration
-    p.extend_from_slice(&0u32.to_be_bytes()); // default_sample_size
-    p.extend_from_slice(&0u32.to_be_bytes()); // default_sample_flags
-    let trex = build_full_box(b"trex", 0, 0, &p);
-    build_box(b"mvex", &trex)
-}
-
 /// tkhd：track 头（flags=3：enabled | in movie）。
-fn build_tkhd(duration_us: u64, width: u32, height: u32) -> Vec<u8> {
+fn build_tkhd(track_id: u32, duration_ms: u64, kind: &TrackKind) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&0u32.to_be_bytes()); // creation_time
     p.extend_from_slice(&0u32.to_be_bytes()); // modification_time
-    p.extend_from_slice(&1u32.to_be_bytes()); // track_ID
+    p.extend_from_slice(&track_id.to_be_bytes()); // track_ID
     p.extend_from_slice(&0u32.to_be_bytes()); // reserved
-    p.extend_from_slice(&(duration_us / 1000).to_be_bytes()); // duration (mvhd timescale)
+    p.extend_from_slice(&(duration_ms as u32).to_be_bytes()); // duration (mvhd timescale)
     p.extend_from_slice(&[0u8; 8]); // reserved
     p.extend_from_slice(&0i16.to_be_bytes()); // layer
     p.extend_from_slice(&0i16.to_be_bytes()); // alternate_group
-    p.extend_from_slice(&0i16.to_be_bytes()); // volume
+    let (volume, w, h) = match kind {
+        TrackKind::Video { width, height } => (0u16, *width << 16, *height << 16),
+        TrackKind::Audio { .. } => (0x0100u16, 0u32, 0u32),
+    };
+    p.extend_from_slice(&volume.to_be_bytes()); // volume: 0 为视频，0x0100 为音频 1.0
     p.extend_from_slice(&[0u8; 2]); // reserved
     p.extend_from_slice(&UNIT_MATRIX);
-    p.extend_from_slice(&(width << 16).to_be_bytes()); // width 16.16
-    p.extend_from_slice(&(height << 16).to_be_bytes()); // height 16.16
+    p.extend_from_slice(&w.to_be_bytes()); // width 16.16
+    p.extend_from_slice(&h.to_be_bytes()); // height 16.16
     build_full_box(b"tkhd", 0, 3, &p)
+}
+
+/// esds：AAC-LC DecoderSpecificInfo（共 42 字节）。
+pub(crate) fn build_esds(asc: &[u8], bitrate_bps: u32) -> Vec<u8> {
+    let mut dsi = Vec::new();
+    dsi.push(0x05); // tag: DecoderSpecificInfo
+    dsi.push(asc.len() as u8);
+    dsi.extend_from_slice(asc);
+
+    let mut dcd = vec![
+        0x04,                 // tag: DecoderConfigDescriptor
+        13 + dsi.len() as u8, // len = 17 (0x11)
+        0x40,                 // objectTypeIndication: MPEG-4 Audio (0x40)
+        0x15,                 // streamType: AudioStream (0x15)
+    ];
+    dcd.extend_from_slice(&[0x00, 0x18, 0x00]); // bufferSizeDB = 6144
+    dcd.extend_from_slice(&bitrate_bps.to_be_bytes()); // maxBitrate
+    dcd.extend_from_slice(&bitrate_bps.to_be_bytes()); // avgBitrate
+    dcd.extend_from_slice(&dsi);
+
+    let sl = [0x06, 0x01, 0x02]; // SLConfigDescriptor: tag 0x06, len 1, predefined 0x02
+
+    let mut es_desc = Vec::new();
+    es_desc.push(0x03); // tag: ES_Descriptor
+    es_desc.extend_from_slice(&[0x80, 0x80, 0x80, (3 + dcd.len() + sl.len()) as u8]); // len: 0x80 0x80 0x80 0x19
+    es_desc.extend_from_slice(&0u16.to_be_bytes()); // ES_ID = 0
+    es_desc.push(0x00); // flags = 0
+    es_desc.extend_from_slice(&dcd);
+    es_desc.extend_from_slice(&sl);
+
+    build_full_box(b"esds", 0, 0, &es_desc)
+}
+
+/// mp4a 音频样本描述项（含盒头共 78 字节：36 字节固定体 + 42 字节 esds）。
+pub(crate) fn build_audio_sample_entry(
+    entry: &[u8; 4],
+    channels: u16,
+    sample_rate: u32,
+    config_boxes: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&[0u8; 6]); // reserved
+    p.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index = 1
+    p.extend_from_slice(&[0u8; 8]); // reserved (sound_version=0, revision=0, vendor=0)
+    p.extend_from_slice(&channels.to_be_bytes()); // channelcount = 2
+    p.extend_from_slice(&16u16.to_be_bytes()); // samplesize = 16
+    p.extend_from_slice(&0u16.to_be_bytes()); // pre_defined = 0
+    p.extend_from_slice(&0u16.to_be_bytes()); // reserved = 0
+    p.extend_from_slice(&(sample_rate << 16).to_be_bytes()); // samplerate = 48000 << 16
+    for cb in config_boxes {
+        p.extend_from_slice(cb);
+    }
+    build_box(entry, &p)
 }
 
 /// avcC：由 SPS/PPS 构建（4 字节长度前缀模式）。
@@ -793,21 +1136,20 @@ fn build_colr() -> Vec<u8> {
 ///
 /// 首样本 PTS 为 0，其 delta 不能取 `PTS-0`（会是 0 或极小值造成虚假条目），
 /// 统一按第二样本的 delta（即实际帧间隔）回填。
-fn build_stts_entries(samples: &[SampleRec], fps: u32) -> Vec<(u32, u32)> {
-    let nominal = (1_000_000 / fps.max(1) as u64).max(1);
+fn build_stts_entries(samples: &[SampleRec], default_delta: u32) -> Vec<(u32, u32)> {
     let mut entries: Vec<(u32, u32)> = Vec::new();
-    let mut prev_pts: u64 = 0;
+    let mut prev_tick: u64 = 0;
     for (i, s) in samples.iter().enumerate() {
         let delta = if i == 0 {
             // 首样本：取第二样本的 delta；只有一个样本时用标称帧间隔。
             samples
                 .get(1)
-                .map(|n| (n.pts_us - s.pts_us) as u32)
-                .unwrap_or(nominal as u32)
+                .map(|n| (n.tick - s.tick) as u32)
+                .unwrap_or(default_delta)
         } else {
-            (s.pts_us - prev_pts) as u32
+            (s.tick - prev_tick) as u32
         };
-        prev_pts = s.pts_us;
+        prev_tick = s.tick;
         let delta = delta.max(1);
         match entries.last_mut() {
             Some(last) if last.1 == delta => last.0 += 1,
@@ -1224,6 +1566,7 @@ mod tests {
             (b"mdhd", 1),
             (b"hdlr", 0),
             (b"vmhd", 0),
+            (b"smhd", 0),
             (b"dref", 0),
             (b"url ", 0),
             (b"stsd", 0),
@@ -1321,5 +1664,468 @@ mod tests {
             .windows(4)
             .position(|w| w == kind)
             .map(|p| p + moov - 4)
+    }
+
+    /// 解析指定内存块中的直接子盒序列
+    fn get_subboxes<'a>(data: &'a [u8]) -> Vec<(&'a [u8; 4], &'a [u8])> {
+        let mut boxes = Vec::new();
+        let mut pos = 0usize;
+        while pos + 8 <= data.len() {
+            let size = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            if size < 8 || pos + size > data.len() {
+                break;
+            }
+            let kind: &'a [u8; 4] = data[pos + 4..pos + 8].try_into().unwrap();
+            boxes.push((kind, &data[pos + 8..pos + size]));
+            pos += size;
+        }
+        boxes
+    }
+
+    /// 写入双轨测试文件（视频 + 音频）。
+    fn write_test_file_multi(
+        dir: &std::path::Path,
+        video_frames: u64,
+        audio_packets: u64,
+    ) -> (std::path::PathBuf, u64) {
+        let path = dir.join(format!("test_multi_{video_frames}_{audio_packets}.mp4"));
+        let (sps, pps) = make_sps_pps();
+        let mut muxer =
+            Mp4Muxer::create_multi(&path, Some((320, 240, 30)), Some((2, 48000))).unwrap();
+
+        let frame_interval = 1_000_000 / 30; // 33333 us
+        for i in 0..video_frames {
+            let is_key = i == 0 || i % 15 == 0;
+            let mut data = Vec::new();
+            if is_key {
+                data.extend_from_slice(&(sps.len() as u32).to_be_bytes());
+                data.extend_from_slice(&sps);
+                data.extend_from_slice(&(pps.len() as u32).to_be_bytes());
+                data.extend_from_slice(&pps);
+            }
+            let payload = [0x65u8; 100];
+            data.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            data.extend_from_slice(&payload);
+            let pts = i * frame_interval;
+            muxer.write_sample(&data, pts, is_key, &sps, &pps).unwrap();
+        }
+
+        // 写入 AAC 音频包（每包 1024 采样，48kHz 下每个包 tick 递增 1024）
+        for i in 0..audio_packets {
+            let aac_frame = [0x21u8; 150];
+            let tick = i * 1024;
+            muxer.write_audio_sample(&aac_frame, tick).unwrap();
+        }
+
+        let size = muxer.finish().unwrap();
+        (path, size)
+    }
+
+    /// 1. 停止后 moov 里恰好 2 个 trak，tkhd.track_ID = 1, 2
+    #[test]
+    fn two_track_moov_has_two_trak() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = write_test_file_multi(dir.path(), 30, 45);
+        let bytes = std::fs::read(&path).unwrap();
+        let moov_pos = find_top_level_box(&bytes, b"moov").unwrap();
+        let moov_sz = read_box_size(&bytes, moov_pos);
+        let moov_body = &bytes[moov_pos + 8..moov_pos + moov_sz];
+
+        let traks: Vec<&[u8]> = get_subboxes(moov_body)
+            .into_iter()
+            .filter(|(k, _)| *k == b"trak")
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(traks.len(), 2, "moov 应恰好包含 2 个 trak 盒");
+
+        let mut track_ids = Vec::new();
+        for trak in &traks {
+            let sub = get_subboxes(trak);
+            let (_, tkhd_body) = sub
+                .iter()
+                .find(|(k, _)| *k == b"tkhd")
+                .expect("trak 应有 tkhd");
+            // tkhd v0: version(1) + flags(3) + creation(4) + mod(4) + track_id(4)
+            assert_eq!(tkhd_body[0], 0, "tkhd 应为 version 0");
+            let track_id = u32::from_be_bytes(tkhd_body[12..16].try_into().unwrap());
+            track_ids.push(track_id);
+        }
+        assert_eq!(track_ids, vec![1, 2], "tkhd track_ID 应为 1 和 2");
+    }
+
+    /// 2. mvex 里 2 个 trex
+    #[test]
+    fn init_moov_has_trex_per_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_init.mp4");
+        let (sps, pps) = make_sps_pps();
+        let mut muxer =
+            Mp4Muxer::create_multi(&path, Some((320, 240, 30)), Some((2, 48000))).unwrap();
+        // 写入首帧以触发 init moov 写入
+        let payload = [0x65u8; 100];
+        let mut data = Vec::new();
+        data.extend_from_slice(&(sps.len() as u32).to_be_bytes());
+        data.extend_from_slice(&sps);
+        data.extend_from_slice(&(pps.len() as u32).to_be_bytes());
+        data.extend_from_slice(&pps);
+        data.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        data.extend_from_slice(&payload);
+        muxer.write_sample(&data, 0, true, &sps, &pps).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        // 录制态文件：ftyp | free | moov(init) | moof ...
+        let ftyp_sz = read_box_size(&bytes, 0);
+        let free_sz = read_box_size(&bytes, ftyp_sz);
+        let init_moov_pos = ftyp_sz + free_sz;
+        assert_eq!(&bytes[init_moov_pos + 4..init_moov_pos + 8], b"moov");
+        let init_moov_sz = read_box_size(&bytes, init_moov_pos);
+        let init_moov_body = &bytes[init_moov_pos + 8..init_moov_pos + init_moov_sz];
+
+        let (_, mvex_body) = get_subboxes(init_moov_body)
+            .into_iter()
+            .find(|(k, _)| *k == b"mvex")
+            .expect("init moov 应包含 mvex");
+
+        let trexes: Vec<&[u8]> = get_subboxes(mvex_body)
+            .into_iter()
+            .filter(|(k, _)| *k == b"trex")
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(trexes.len(), 2, "mvex 应恰好包含 2 个 trex 盒");
+
+        let mut trex_track_ids = Vec::new();
+        for trex in &trexes {
+            // trex: version(1) + flags(3) + track_ID(4)
+            let tid = u32::from_be_bytes(trex[4..8].try_into().unwrap());
+            trex_track_ids.push(tid);
+        }
+        assert_eq!(trex_track_ids, vec![1, 2]);
+    }
+
+    /// 3. 音频 minf 是 smhd、stsd 是 mp4a、含 esds
+    #[test]
+    fn audio_trak_uses_smhd_and_mp4a() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = write_test_file_multi(dir.path(), 30, 45);
+        let bytes = std::fs::read(&path).unwrap();
+        let moov_pos = find_top_level_box(&bytes, b"moov").unwrap();
+        let moov_sz = read_box_size(&bytes, moov_pos);
+        let moov_body = &bytes[moov_pos + 8..moov_pos + moov_sz];
+
+        let traks: Vec<&[u8]> = get_subboxes(moov_body)
+            .into_iter()
+            .filter(|(k, _)| *k == b"trak")
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(traks.len(), 2);
+        let audio_trak = traks[1];
+        let mdia = get_subboxes(audio_trak)
+            .into_iter()
+            .find(|(k, _)| *k == b"mdia")
+            .unwrap()
+            .1;
+        let minf = get_subboxes(mdia)
+            .into_iter()
+            .find(|(k, _)| *k == b"minf")
+            .unwrap()
+            .1;
+        let minf_boxes = get_subboxes(minf);
+        assert!(
+            minf_boxes.iter().any(|(k, _)| *k == b"smhd"),
+            "audio minf 应包含 smhd"
+        );
+        assert!(
+            !minf_boxes.iter().any(|(k, _)| *k == b"vmhd"),
+            "audio minf 不应包含 vmhd"
+        );
+
+        let stbl = minf_boxes
+            .into_iter()
+            .find(|(k, _)| *k == b"stbl")
+            .unwrap()
+            .1;
+        let stbl_boxes = get_subboxes(stbl);
+        let (_, stsd_body) = stbl_boxes.into_iter().find(|(k, _)| *k == b"stsd").unwrap();
+        assert_eq!(u32::from_be_bytes(stsd_body[4..8].try_into().unwrap()), 1);
+        let mp4a_entry = &stsd_body[8..];
+        let entry_type: &[u8; 4] = mp4a_entry[4..8].try_into().unwrap();
+        assert_eq!(entry_type, b"mp4a", "stsd 应为 mp4a 条目");
+
+        let entry_sz = u32::from_be_bytes(mp4a_entry[0..4].try_into().unwrap()) as usize;
+        let mp4a_body = &mp4a_entry[8..entry_sz];
+        let config_boxes = get_subboxes(&mp4a_body[28..]);
+        assert!(
+            config_boxes.iter().any(|(k, _)| *k == b"esds"),
+            "mp4a 应包含 esds 盒"
+        );
+    }
+
+    /// 4. 42 字节，objectTypeIndication=0x40、ASC=11 90
+    #[test]
+    fn esds_matches_expected_bytes() {
+        let esds = build_esds(&ASC_48K_STEREO, 320_000);
+        assert_eq!(esds.len(), 42, "esds 盒总长必须为 42 字节");
+        assert_eq!(&esds[0..4], &42u32.to_be_bytes());
+        assert_eq!(&esds[4..8], b"esds");
+        // full box: version=0, flags=0
+        assert_eq!(&esds[8..12], &[0, 0, 0, 0]);
+
+        // ES_Descriptor tag 0x03
+        assert_eq!(esds[12], 0x03);
+        assert_eq!(&esds[13..17], &[0x80, 0x80, 0x80, 0x19]);
+        assert_eq!(&esds[17..19], &[0x00, 0x00]); // ES_ID
+        assert_eq!(esds[19], 0x00); // flags
+        // DecoderConfigDescriptor tag 0x04
+        assert_eq!(esds[20], 0x04);
+        assert_eq!(esds[21], 0x11); // len = 17
+        // objectTypeIndication = 0x40 (MPEG-4 Audio)
+        assert_eq!(esds[22], 0x40);
+        // streamType = 0x15 (AudioStream)
+        assert_eq!(esds[23], 0x15);
+
+        // maxBitrate & avgBitrate
+        assert_eq!(&esds[27..31], &320_000u32.to_be_bytes());
+        assert_eq!(&esds[31..35], &320_000u32.to_be_bytes());
+
+        // DecoderSpecificInfo tag 0x05, len 2, ASC = [0x11, 0x90]
+        assert_eq!(esds[35], 0x05);
+        assert_eq!(esds[36], 0x02);
+        assert_eq!(&esds[37..39], &[0x11, 0x90]);
+
+        // 测试自定义 128 kbps 时的码率写入
+        let esds_128 = build_esds(&ASC_48K_STEREO, 128_000);
+        assert_eq!(&esds_128[27..31], &128_000u32.to_be_bytes());
+        assert_eq!(&esds_128[31..35], &128_000u32.to_be_bytes());
+    }
+
+    /// 5. 音频 stts 只有一条 entry 且 delta=1024
+    #[test]
+    fn audio_stts_is_single_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio_packets = 50;
+        let (path, _) = write_test_file_multi(dir.path(), 30, audio_packets);
+        let bytes = std::fs::read(&path).unwrap();
+        let moov_pos = find_top_level_box(&bytes, b"moov").unwrap();
+        let moov_sz = read_box_size(&bytes, moov_pos);
+        let moov_body = &bytes[moov_pos + 8..moov_pos + moov_sz];
+
+        let traks: Vec<&[u8]> = get_subboxes(moov_body)
+            .into_iter()
+            .filter(|(k, _)| *k == b"trak")
+            .map(|(_, b)| b)
+            .collect();
+        let audio_trak = traks[1];
+        let mdia = get_subboxes(audio_trak)
+            .into_iter()
+            .find(|(k, _)| *k == b"mdia")
+            .unwrap()
+            .1;
+        let minf = get_subboxes(mdia)
+            .into_iter()
+            .find(|(k, _)| *k == b"minf")
+            .unwrap()
+            .1;
+        let stbl = get_subboxes(minf)
+            .into_iter()
+            .find(|(k, _)| *k == b"stbl")
+            .unwrap()
+            .1;
+        let (_, stts_body) = get_subboxes(stbl)
+            .into_iter()
+            .find(|(k, _)| *k == b"stts")
+            .expect("audio trak 必须有 stts");
+
+        // stts: version(1) + flags(3) + entry_count(4) + (sample_count(4), sample_delta(4)) * n
+        assert_eq!(stts_body[0], 0);
+        let entry_count = u32::from_be_bytes(stts_body[4..8].try_into().unwrap());
+        assert_eq!(entry_count, 1, "音频 stts 必须折叠成一条 entry");
+        let sample_count = u32::from_be_bytes(stts_body[8..12].try_into().unwrap());
+        let sample_delta = u32::from_be_bytes(stts_body[12..16].try_into().unwrap());
+        assert_eq!(sample_count, audio_packets as u32);
+        assert_eq!(sample_delta, 1024);
+    }
+
+    /// 6. 音频轨无 stss
+    #[test]
+    fn audio_trak_has_no_stss() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = write_test_file_multi(dir.path(), 30, 45);
+        let bytes = std::fs::read(&path).unwrap();
+        let moov_pos = find_top_level_box(&bytes, b"moov").unwrap();
+        let moov_sz = read_box_size(&bytes, moov_pos);
+        let moov_body = &bytes[moov_pos + 8..moov_pos + moov_sz];
+
+        let traks: Vec<&[u8]> = get_subboxes(moov_body)
+            .into_iter()
+            .filter(|(k, _)| *k == b"trak")
+            .map(|(_, b)| b)
+            .collect();
+        let video_trak = traks[0];
+        let audio_trak = traks[1];
+
+        let video_stbl = get_subboxes(
+            get_subboxes(
+                get_subboxes(video_trak)
+                    .into_iter()
+                    .find(|(k, _)| *k == b"mdia")
+                    .unwrap()
+                    .1,
+            )
+            .into_iter()
+            .find(|(k, _)| *k == b"minf")
+            .unwrap()
+            .1,
+        )
+        .into_iter()
+        .find(|(k, _)| *k == b"stbl")
+        .unwrap()
+        .1;
+        assert!(
+            get_subboxes(video_stbl).iter().any(|(k, _)| *k == b"stss"),
+            "视频轨必须有 stss"
+        );
+
+        let audio_stbl = get_subboxes(
+            get_subboxes(
+                get_subboxes(audio_trak)
+                    .into_iter()
+                    .find(|(k, _)| *k == b"mdia")
+                    .unwrap()
+                    .1,
+            )
+            .into_iter()
+            .find(|(k, _)| *k == b"minf")
+            .unwrap()
+            .1,
+        )
+        .into_iter()
+        .find(|(k, _)| *k == b"stbl")
+        .unwrap()
+        .1;
+        assert!(
+            !get_subboxes(audio_stbl).iter().any(|(k, _)| *k == b"stss"),
+            "音频轨绝不能有 stss"
+        );
+    }
+
+    /// 7. 音频比视频长时 mvhd.duration 取音频
+    #[test]
+    fn mvhd_duration_is_max_of_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        // Case 1: 音频长于视频
+        // 视频：15 帧 @ 30fps = 500 ms (0.5s)
+        // 音频：94 包 * 1024 / 48000 ≈ 2.005 s = 2005 ms
+        let (path1, _) = write_test_file_multi(dir.path(), 15, 94);
+        let bytes1 = std::fs::read(&path1).unwrap();
+        let moov1_pos = find_top_level_box(&bytes1, b"moov").unwrap();
+        let moov1_sz = read_box_size(&bytes1, moov1_pos);
+        let moov1_body = &bytes1[moov1_pos + 8..moov1_pos + moov1_sz];
+        let (_, mvhd1_body) = get_subboxes(moov1_body)
+            .into_iter()
+            .find(|(k, _)| *k == b"mvhd")
+            .unwrap();
+        // mvhd v0: version(1)+flags(3)+creation(4)+mod(4)+timescale(4)+duration(4)
+        let timescale1 = u32::from_be_bytes(mvhd1_body[12..16].try_into().unwrap());
+        let duration1 = u32::from_be_bytes(mvhd1_body[16..20].try_into().unwrap());
+        assert_eq!(timescale1, 1000);
+        assert_eq!(duration1, (94 * 1024 * 1000 / 48000) as u32); // 2005 ms > 500 ms
+
+        // Case 2: 视频长于音频
+        // 视频：60 帧 @ 30fps = 2000 ms
+        // 音频：20 包 * 1024 / 48000 ≈ 426 ms
+        let path2 = dir.path().join("case2.mp4");
+        let (sps, pps) = make_sps_pps();
+        let mut muxer =
+            Mp4Muxer::create_multi(&path2, Some((320, 240, 30)), Some((2, 48000))).unwrap();
+        for i in 0..60u64 {
+            let is_key = i == 0 || i % 15 == 0;
+            let mut data = Vec::new();
+            if is_key {
+                data.extend_from_slice(&(sps.len() as u32).to_be_bytes());
+                data.extend_from_slice(&sps);
+                data.extend_from_slice(&(pps.len() as u32).to_be_bytes());
+                data.extend_from_slice(&pps);
+            }
+            let payload = [0x65u8; 100];
+            data.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            data.extend_from_slice(&payload);
+            muxer
+                .write_sample(&data, i * 33333, is_key, &sps, &pps)
+                .unwrap();
+        }
+        for i in 0..20u64 {
+            muxer.write_audio_sample(&[0x21u8; 150], i * 1024).unwrap();
+        }
+        muxer.finish().unwrap();
+
+        let bytes2 = std::fs::read(&path2).unwrap();
+        let moov2_pos = find_top_level_box(&bytes2, b"moov").unwrap();
+        let moov2_sz = read_box_size(&bytes2, moov2_pos);
+        let moov2_body = &bytes2[moov2_pos + 8..moov2_pos + moov2_sz];
+        let (_, mvhd2_body) = get_subboxes(moov2_body)
+            .into_iter()
+            .find(|(k, _)| *k == b"mvhd")
+            .unwrap();
+        let duration2 = u32::from_be_bytes(mvhd2_body[16..20].try_into().unwrap());
+        // 60 frames * 33333 us ≈ 1999 ms
+        assert!((1990..=2010).contains(&duration2));
+    }
+
+    /// 8. 不传音频时产物与改造前逐字节一致
+    #[test]
+    fn video_only_output_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path1, size1) = write_test_file(dir.path());
+        let bytes1 = std::fs::read(&path1).unwrap();
+
+        let path2 = dir.path().join("test_legacy_create.mp4");
+        let (sps, pps) = make_sps_pps();
+        let mut muxer2 = Mp4Muxer::create_multi(&path2, Some((320, 240, 30)), None).unwrap();
+        let frame_interval = 1_000_000 / 30;
+        let mut pts = 0u64;
+        for i in 0..30u64 {
+            let is_key = i == 0 || i == 15;
+            let mut data = Vec::new();
+            if is_key {
+                data.extend_from_slice(&(sps.len() as u32).to_be_bytes());
+                data.extend_from_slice(&sps);
+                data.extend_from_slice(&(pps.len() as u32).to_be_bytes());
+                data.extend_from_slice(&pps);
+            }
+            let payload = [0x65u8; 100];
+            data.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            data.extend_from_slice(&payload);
+            muxer2.write_sample(&data, pts, is_key, &sps, &pps).unwrap();
+            pts += frame_interval;
+        }
+        let size2 = muxer2.finish().unwrap();
+        let bytes2 = std::fs::read(&path2).unwrap();
+
+        assert_eq!(size1, size2);
+        assert_eq!(bytes1, bytes2, "无音轨输出必须与改造前逐字节一致");
+    }
+
+    /// init moov 迟迟不落盘时，音频 pending 必须有上界。
+    ///
+    /// 音频线程比视频先跑起来是常态；若视频首个关键帧一直不来（画面完全静止、
+    /// DXGI 只交付一帧、编码器卡住），`pending` 就会无限增长。这里锁住上限：
+    /// 丢最旧的包，内存有界，录制不中断。
+    #[test]
+    fn audio_pending_is_bounded_before_init_moov() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bounded_pending.mp4");
+        let mut muxer =
+            Mp4Muxer::create_multi(&path, Some((320, 240, 30)), Some((2, 48_000))).unwrap();
+
+        // 一直不写视频关键帧 → init moov 永不落盘 → 音频只能进 pending。
+        for i in 0..500u64 {
+            muxer.write_audio_sample(&[0x21u8; 120], i * 1024).unwrap();
+        }
+        let n = muxer.sample_count();
+        assert!(
+            n <= 94,
+            "音频 pending 应有 2 秒（94 包）上限，实际积压 {n} 包"
+        );
+        assert!(n > 0, "不应把包全丢光");
     }
 }

@@ -56,14 +56,19 @@ impl MemBox {
 }
 
 /// 从 init moov 里解出的、重建末尾 moov 需要的布局信息。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct TrackLayout {
+    pub(crate) track_id: u32,
     /// mvhd 时基（tkhd / mvhd 的时长用它）
     pub(crate) movie_timescale: u32,
     /// mdhd 时基（stts / trun 的时长用它）
     pub(crate) media_timescale: u32,
     /// trex 的样本默认值
     pub(crate) defaults: SampleDefaults,
+    /// stsd 盒完整字节（含盒头）
+    pub(crate) stsd: Vec<u8>,
+    /// handler_type（b"vide" / b"soun"）
+    pub(crate) handler_type: [u8; 4],
 }
 
 /// trex / tfhd 的「默认样本值」。
@@ -207,20 +212,11 @@ pub(crate) fn box_body(buf: &[u8]) -> io::Result<&[u8]> {
 
 // ---------------------------------------------------------------- moov 解析
 
-/// 从 init moov 的 payload 里解出时基与 `trex` 默认值。
-///
-/// 只支持单轨：录制器只产视频轨，多轨时分片里的 `traf` 会互相穿插，
-/// 与其猜哪条是哪条，不如直接报错。
-pub(crate) fn parse_layout(moov: &[u8]) -> io::Result<TrackLayout> {
+/// 从 init moov 的 payload 里解出所有轨道的时基、`trex` 默认值与 `stsd`。
+pub(crate) fn parse_layouts(
+    moov: &[u8],
+) -> io::Result<std::collections::HashMap<u32, TrackLayout>> {
     let boxes = split_boxes(moov)?;
-
-    let traks: Vec<&MemBox> = boxes.iter().filter(|b| &b.kind == b"trak").collect();
-    if traks.len() != 1 {
-        return Err(io::Error::other(format!(
-            "只支持单轨文件，实际有 {} 条 trak",
-            traks.len()
-        )));
-    }
 
     let mvhd = boxes
         .iter()
@@ -228,30 +224,116 @@ pub(crate) fn parse_layout(moov: &[u8]) -> io::Result<TrackLayout> {
         .ok_or_else(|| io::Error::other("moov 缺少 mvhd"))?;
     let movie_timescale = read_timescale(mvhd.body(moov))?;
 
-    let mdhd_full = descend_full(moov, &[*b"trak", *b"mdia", *b"mdhd"])?;
-    let media_timescale = read_timescale(box_body(mdhd_full)?)?;
-
-    let mut defaults = SampleDefaults::default();
+    let mut mvex_defaults: std::collections::HashMap<u32, SampleDefaults> =
+        std::collections::HashMap::new();
     if let Some(mvex) = boxes.iter().find(|b| &b.kind == b"mvex") {
-        if let Some(trex) = split_boxes(mvex.body(moov))?
+        for trex in split_boxes(mvex.body(moov))?
             .iter()
-            .find(|b| &b.kind == b"trex")
+            .filter(|b| &b.kind == b"trex")
         {
             let body = trex.body(mvex.body(moov));
-            // trex: track_ID(4) sample_desc_index(4) duration(4) size(4) flags(4)
             if body.len() >= 20 {
-                defaults.duration = u32::from_be_bytes(body[8..12].try_into().unwrap());
-                defaults.size = u32::from_be_bytes(body[12..16].try_into().unwrap());
-                defaults.flags = u32::from_be_bytes(body[16..20].try_into().unwrap());
+                let track_id = u32::from_be_bytes(body[4..8].try_into().unwrap());
+                let duration = u32::from_be_bytes(body[8..12].try_into().unwrap());
+                let size = u32::from_be_bytes(body[12..16].try_into().unwrap());
+                let flags = if body.len() >= 24 {
+                    u32::from_be_bytes(body[16..20].try_into().unwrap())
+                } else {
+                    0
+                };
+                mvex_defaults.insert(
+                    track_id,
+                    SampleDefaults {
+                        duration,
+                        size,
+                        flags,
+                    },
+                );
             }
         }
     }
 
-    Ok(TrackLayout {
-        movie_timescale,
-        media_timescale,
-        defaults,
-    })
+    let mut layouts = std::collections::HashMap::new();
+    for trak in boxes.iter().filter(|b| &b.kind == b"trak") {
+        let trak_body = trak.body(moov);
+        let trak_boxes = split_boxes(trak_body)?;
+
+        let tkhd = trak_boxes
+            .iter()
+            .find(|b| &b.kind == b"tkhd")
+            .ok_or_else(|| io::Error::other("trak 缺少 tkhd"))?;
+        let tkhd_body = tkhd.body(trak_body);
+        let version = *tkhd_body
+            .first()
+            .ok_or_else(|| io::Error::other("tkhd 为空"))?;
+        let track_id = if version == 1 {
+            if tkhd_body.len() < 24 {
+                return Err(io::Error::other("tkhd v1 长度不足"));
+            }
+            u32::from_be_bytes(tkhd_body[20..24].try_into().unwrap())
+        } else {
+            if tkhd_body.len() < 16 {
+                return Err(io::Error::other("tkhd v0 长度不足"));
+            }
+            u32::from_be_bytes(tkhd_body[12..16].try_into().unwrap())
+        };
+
+        let mdia = trak_boxes
+            .iter()
+            .find(|b| &b.kind == b"mdia")
+            .ok_or_else(|| io::Error::other("trak 缺少 mdia"))?;
+        let mdia_body = mdia.body(trak_body);
+        let mdia_boxes = split_boxes(mdia_body)?;
+
+        let mdhd = mdia_boxes
+            .iter()
+            .find(|b| &b.kind == b"mdhd")
+            .ok_or_else(|| io::Error::other("mdia 缺少 mdhd"))?;
+        let media_timescale = read_timescale(mdhd.body(mdia_body))?;
+
+        let mut handler_type = [0u8; 4];
+        if let Some(hdlr) = mdia_boxes.iter().find(|b| &b.kind == b"hdlr") {
+            let hdlr_body = hdlr.body(mdia_body);
+            if hdlr_body.len() >= 12 {
+                handler_type.copy_from_slice(&hdlr_body[8..12]);
+            }
+        }
+
+        let stsd_full = descend_full(trak_body, &[*b"mdia", *b"minf", *b"stbl", *b"stsd"])?;
+        let defaults = mvex_defaults.get(&track_id).copied().unwrap_or_default();
+
+        layouts.insert(
+            track_id,
+            TrackLayout {
+                track_id,
+                movie_timescale,
+                media_timescale,
+                defaults,
+                stsd: stsd_full.to_vec(),
+                handler_type,
+            },
+        );
+    }
+
+    if layouts.is_empty() {
+        return Err(io::Error::other("moov 中未找到任何 trak"));
+    }
+
+    Ok(layouts)
+}
+
+/// 从 init moov 的 payload 里解出单轨时基与 `trex` 默认值（向后兼容）。
+#[allow(dead_code)]
+pub(crate) fn parse_layout(moov: &[u8]) -> io::Result<TrackLayout> {
+    let map = parse_layouts(moov)?;
+    if map.len() == 1 {
+        Ok(map.into_values().next().unwrap())
+    } else {
+        Err(io::Error::other(format!(
+            "只支持单轨文件，实际有 {} 条 trak",
+            map.len()
+        )))
+    }
 }
 
 /// 读 mvhd / mdhd 的 timescale（两者布局一致）。
@@ -267,6 +349,7 @@ fn read_timescale(body: &[u8]) -> io::Result<u32> {
 ///
 /// 刻意逐字节拷贝而不是重建：`avc1` / `hvc1` / `av01` 的配置盒（`avcC` / `hvcC` /
 /// `av1C`）由 MF 填写，任何重写都是在冒险——解码器只认它自己写的那一份。
+#[allow(dead_code)]
 pub(crate) fn find_stsd(moov: &[u8]) -> io::Result<Vec<u8>> {
     let stsd = descend_full(moov, &[*b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsd"])?;
     Ok(stsd.to_vec())
@@ -274,18 +357,13 @@ pub(crate) fn find_stsd(moov: &[u8]) -> io::Result<Vec<u8>> {
 
 // --------------------------------------------------------------- 分片解析
 
-/// 解析一个 `moof`，把其中的样本追加到 `out`。
-///
-/// `moof_abs` 是它在文件里的绝对偏移，用于 `tfhd` 没给 base offset 时定位样本。
-/// **多个分片必须复用同一个 `out`**：没有 `tfdt` 时解码时间是靠前一片续接的。
-pub(crate) fn parse_fragment(
+/// 解析一个 `moof`，按每个 `traf` 的 `tfhd.track_ID` 分派到对应的样本列表。
+pub(crate) fn parse_fragment_multi(
     moof: &[u8],
     moof_abs: u64,
-    layout: &TrackLayout,
-    out: &mut Vec<SampleInfo>,
+    layouts: &std::collections::HashMap<u32, TrackLayout>,
+    track_samples: &mut std::collections::HashMap<u32, Vec<SampleInfo>>,
 ) -> io::Result<()> {
-    let mut track_id: Option<u32> = None;
-
     let moof_body = box_body(moof)?;
     for child in split_boxes(moof_body)? {
         if &child.kind != b"traf" {
@@ -299,25 +377,18 @@ pub(crate) fn parse_fragment(
             .find(|b| &b.kind == b"tfhd")
             .ok_or_else(|| io::Error::other("traf 缺少 tfhd"))?;
         let (id, base_data_offset, tfhd_defaults) = parse_tfhd(tfhd.body(traf))?;
-        match track_id {
-            None => track_id = Some(id),
-            Some(prev) if prev != id => {
-                return Err(io::Error::other(format!(
-                    "单个分片里出现多条轨道（{prev} 与 {id}），不支持"
-                )));
-            }
-            _ => {}
-        }
 
-        // tfdt 是可选的：MF 的 MP4 sink 就不写它，此时解码时间按「上一个分片的
-        // 结尾」继续推进——对单轨连续录制来说，这正是它想表达的意思。
-        // stts 只存增量，所以绝对起点只影响「首个样本从几开始」，不影响播放。
+        let layout = layouts.get(&id).ok_or_else(|| {
+            io::Error::other(format!("traf 中的 track_ID {id} 在 init moov 中未定义"))
+        })?;
+
+        let out = track_samples.entry(id).or_default();
+
         let mut dts = match traf_boxes.iter().find(|b| &b.kind == b"tfdt") {
             Some(tfdt) => read_tfdt(tfdt.body(traf))?,
             None => out.last().map(|s| s.dts + s.duration as u64).unwrap_or(0),
         };
 
-        // 样本基准位置：tfhd 显式给了就用它，否则按规范退回 moof 起点。
         let base = base_data_offset.unwrap_or(moof_abs);
         let defaults = SampleDefaults {
             duration: pick(tfhd_defaults.duration, layout.defaults.duration),
@@ -344,6 +415,26 @@ pub(crate) fn parse_fragment(
                 dts += run.duration as u64;
             }
         }
+    }
+    Ok(())
+}
+
+/// 解析单轨 `moof`（向后兼容）。
+#[allow(dead_code)]
+pub(crate) fn parse_fragment(
+    moof: &[u8],
+    moof_abs: u64,
+    layout: &TrackLayout,
+    out: &mut Vec<SampleInfo>,
+) -> io::Result<()> {
+    let mut map = std::collections::HashMap::new();
+    map.insert(layout.track_id, layout.clone());
+    let mut out_map = std::collections::HashMap::new();
+    let prev = std::mem::take(out);
+    out_map.insert(layout.track_id, prev);
+    parse_fragment_multi(moof, moof_abs, &map, &mut out_map)?;
+    if let Some(samples) = out_map.remove(&layout.track_id) {
+        *out = samples;
     }
     Ok(())
 }

@@ -41,7 +41,7 @@ jobs:
       - name: Upload DLL
         uses: actions/upload-artifact@v4
         with:
-          name: recorder_core-x86_64-pc-windows-msvc
+          name: murecorder_core-x86_64-pc-windows-msvc
           path: |
-            target/release/recorder_core.dll
+            target/release/murecorder_core.dll
             include/recorder.h

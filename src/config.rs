@@ -6,7 +6,25 @@
 use crate::error::RecorderError;
 
 /// ABI 版本，必须与 C 侧 `RECORDER_ABI_VERSION` 一致。
-pub const ABI_VERSION: u32 = 1;
+///
+/// ## 版本历史
+///
+/// * **v1** —— 首版：视频区域/帧率/编码器/码率 + 音频音源四字段。
+/// * **v2** —— 尾部追加 `audio_bitrate_kbps`（音频编码码率，kbps）。
+///
+/// ## 为什么 v1 → v2 必须升版本，而不是「尾部追加天然兼容」
+///
+/// 「只追加尾部字段」在**宿主与库一起重编译**时确实安全，但 ABI 的契约是
+/// **已编译的旧宿主能继续用新 dll**。旧宿主的 `RecorderConfig` 比新 dll 的
+/// 短 4 字节，`read_cstr` 之后的 `audio_process_id` 之后就会读到调用方栈上的
+/// 垃圾值，被当成 `audio_bitrate_kbps` 校验 → 大概率 `REC_ERR_INVALID`（看起来
+/// 像误报），小概率凑巧落在合法档位（变成静默的错误码率）。
+/// 更糟的是越界读本身就是 UB。
+///
+/// 与其让旧宿主拿到不可解释的失败，不如让它拿到一句明确的
+/// 「abi_version 不匹配：期望 2，实际 1」——**宁可拒绝，不要 UB**。
+/// 升级成本只有 C# 侧 `AbiVersion` 常量改一个数字。
+pub const ABI_VERSION: u32 = 2;
 
 /// 音源类型，与 C 侧 `AudioSourceType` 一一对应。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,10 +77,6 @@ impl EncoderPreference {
 }
 
 /// 校验后的配置（Rust 内部表示）。字符串已复制为 owned，生命周期自洽。
-///
-/// 部分字段（encoder / capture_cursor / audio_*）为 M2–M5 能力预留，
-/// M1 仅做校验与透传，故标注 allow(dead_code)。
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RecordingConfig {
     pub region_x: i32,
@@ -78,6 +92,7 @@ pub struct RecordingConfig {
     pub audio_device_id: Option<String>,
     pub audio_window_hwnd: u64,
     pub audio_process_id: u32,
+    pub audio_bitrate_kbps: u32,
 }
 
 /// C ABI 传入的原始配置（`#[repr(C)]` 与 recorder.h 严格对齐）。
@@ -98,6 +113,7 @@ pub struct RecorderConfigFfi {
     pub audio_device_id: *const u8,
     pub audio_window_hwnd: u64,
     pub audio_process_id: u32,
+    pub audio_bitrate_kbps: u32,
 }
 
 /// 从 FFI 指针读取 C 字符串（不持有，只读借用）。
@@ -194,6 +210,16 @@ impl RecordingConfig {
             ));
         }
 
+        let audio_bitrate_kbps = match ffi.audio_bitrate_kbps {
+            0 => 320,
+            kbps @ (96 | 128 | 160 | 192 | 256 | 320) => kbps,
+            other => {
+                return Err(RecorderError::invalid(format!(
+                    "不支持的 audio_bitrate_kbps: {other}，须为 0（默认 320）或 [96, 128, 160, 192, 256, 320] 之一"
+                )));
+            }
+        };
+
         Ok(Self {
             region_x: ffi.region_x,
             region_y: ffi.region_y,
@@ -208,6 +234,7 @@ impl RecordingConfig {
             audio_device_id,
             audio_window_hwnd: ffi.audio_window_hwnd,
             audio_process_id: ffi.audio_process_id,
+            audio_bitrate_kbps,
         })
     }
 }
@@ -232,6 +259,7 @@ mod tests {
             audio_device_id: std::ptr::null(),
             audio_window_hwnd: 0,
             audio_process_id: 0,
+            audio_bitrate_kbps: 0,
         }
     }
 
@@ -250,6 +278,29 @@ mod tests {
         ffi.abi_version = 99;
         let err = unsafe { RecordingConfig::from_ffi(&ffi) }.unwrap_err();
         assert_eq!(err.code().code(), 1); // REC_ERR_INVALID
+    }
+
+    /// v1 是「加了尾部字段但没升版本」的那个版本。
+    ///
+    /// 必须被**明确拒绝**而不是放行：v1 结构体比 v2 短 4 字节，
+    /// 放行会让 `audio_bitrate_kbps` 读到调用方栈上的垃圾。拒绝信息要能
+    /// 直接指导宿主改代码（期望 v 实际 v）。
+    #[test]
+    fn abi_v1_is_rejected_with_actionable_message() {
+        assert_eq!(ABI_VERSION, 2, "本测试锁定 v2；升版本时请连带更新");
+
+        let mut ffi = base_ffi();
+        ffi.abi_version = 1;
+        let err = unsafe { RecordingConfig::from_ffi(&ffi) }.unwrap_err();
+        assert_eq!(err.code().code(), 1); // REC_ERR_INVALID
+
+        let msg = err.message();
+        assert!(
+            msg.contains("abi_version"),
+            "错误信息应点名 abi_version：{msg}"
+        );
+        assert!(msg.contains('2'), "错误信息应写出期望版本：{msg}");
+        assert!(msg.contains('1'), "错误信息应写出实际版本：{msg}");
     }
 
     #[test]
@@ -289,5 +340,32 @@ mod tests {
         let mut ffi = base_ffi();
         ffi.output_path = std::ptr::null();
         assert!(unsafe { RecordingConfig::from_ffi(&ffi) }.is_err());
+    }
+
+    #[test]
+    fn audio_bitrate_defaults_to_320_when_zero() {
+        let mut ffi = base_ffi();
+        ffi.audio_bitrate_kbps = 0;
+        let cfg = unsafe { RecordingConfig::from_ffi(&ffi) }.unwrap();
+        assert_eq!(cfg.audio_bitrate_kbps, 320);
+    }
+
+    #[test]
+    fn audio_bitrate_accepts_supported_tiers() {
+        for &tier in &[96, 128, 160, 192, 256, 320] {
+            let mut ffi = base_ffi();
+            ffi.audio_bitrate_kbps = tier;
+            let cfg = unsafe { RecordingConfig::from_ffi(&ffi) }.unwrap();
+            assert_eq!(cfg.audio_bitrate_kbps, tier);
+        }
+    }
+
+    #[test]
+    fn audio_bitrate_rejects_unsupported_values() {
+        for &invalid in &[32, 64, 100, 200, 384, 512] {
+            let mut ffi = base_ffi();
+            ffi.audio_bitrate_kbps = invalid;
+            assert!(unsafe { RecordingConfig::from_ffi(&ffi) }.is_err());
+        }
     }
 }

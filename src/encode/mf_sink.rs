@@ -28,18 +28,22 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFAttributes, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType, IMFSample,
     IMFSinkWriter, MF_E_TOPO_CODEC_NOT_FOUND, MF_LOW_LATENCY, MF_MPEG4SINK_MIN_FRAGMENT_DURATION,
-    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE,
-    MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
-    MF_SINK_WRITER_D3D_MANAGER, MF_TRANSCODE_CONTAINERTYPE, MF_VERSION, MFCreateAttributes,
-    MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample,
-    MFCreateSinkWriterFromMediaSink, MFCreateSinkWriterFromURL, MFMediaType_Video,
-    MFNominalRange_16_235, MFSTARTUP_FULL, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFTranscodeContainerType_FMPEG4,
-    MFTranscodeContainerType_MPEG4, MFVideoFormat_ARGB32, MFVideoFormat_AV1, MFVideoFormat_H264,
-    MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709,
-    MFVideoTransFunc_709, MFVideoTransferMatrix_BT709,
+    MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, MF_MT_AAC_PAYLOAD_TYPE,
+    MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT,
+    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES,
+    MF_MT_YUV_MATRIX, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SINK_WRITER_D3D_MANAGER,
+    MF_TRANSCODE_CONTAINERTYPE, MF_VERSION, MFAudioFormat_AAC, MFAudioFormat_PCM,
+    MFCreateAttributes, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateMediaType,
+    MFCreateMemoryBuffer, MFCreateSample, MFCreateSinkWriterFromMediaSink,
+    MFCreateSinkWriterFromURL, MFMediaType_Audio, MFMediaType_Video, MFNominalRange_16_235,
+    MFSTARTUP_FULL, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ASYNCMFT,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
+    MFTranscodeContainerType_FMPEG4, MFTranscodeContainerType_MPEG4, MFVideoFormat_ARGB32,
+    MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
+    MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
+    MFVideoTransferMatrix_BT709,
 };
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -285,6 +289,7 @@ pub struct GpuSinkWriter {
     context: ID3D11DeviceContext,
     sink_writer: IMFSinkWriter,
     stream_index: u32,
+    audio_stream_index: Option<u32>,
     cropped_texture: ID3D11Texture2D,
     converter: Option<D3D11VideoConverter>,
     width: u32,
@@ -468,6 +473,7 @@ impl GpuSinkWriter {
         bitrate_kbps: u32,
         codec: GpuCodec,
         container: ContainerMode,
+        audio_bitrate_kbps: Option<u32>,
     ) -> WinResult<Self> {
         let guard = MfRuntimeGuard::new()?;
 
@@ -627,6 +633,38 @@ impl GpuSinkWriter {
             in_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
 
             sink_writer.SetInputMediaType(stream_index, &in_type, None)?;
+
+            // 6b. 若启用音频，配置输出与输入音频流 (AAC-LC / 48kHz / 立体声 / 指定码率)
+            let audio_stream_index = if let Some(audio_kbps) = audio_bitrate_kbps {
+                let audio_out: IMFMediaType = MFCreateMediaType()?;
+                audio_out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+                audio_out.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
+                audio_out.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
+                audio_out.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000)?;
+                audio_out.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+                audio_out.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4)?;
+                let avg_bytes = (audio_kbps * 1000) / 8;
+                audio_out.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, avg_bytes)?;
+                audio_out.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)?;
+                audio_out.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29)?;
+
+                let audio_idx = sink_writer.AddStream(&audio_out)?;
+
+                let audio_in: IMFMediaType = MFCreateMediaType()?;
+                audio_in.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+                audio_in.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+                audio_in.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
+                audio_in.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000)?;
+                audio_in.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+                audio_in.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4)?;
+                audio_in.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 48000 * 4)?;
+
+                sink_writer.SetInputMediaType(audio_idx, &audio_in, None)?;
+                Some(audio_idx)
+            } else {
+                None
+            };
+
             // 真正的协商在这里发生：MFT 找不到、或它不接受「该编码器 + 该容器」
             // 的组合时，只有 BeginWriting 会报 MF_E_INVALIDMEDIATYPE。
             sink_writer.BeginWriting()?;
@@ -648,14 +686,16 @@ impl GpuSinkWriter {
                             ),
                         )
                     })?;
-                    let muxer = Mp4Muxer::create_with_description(
+                    let mut muxer = Mp4Muxer::create_multi_with_audio_bitrate(
                         &PathBuf::from(output_file),
-                        aligned_width,
-                        aligned_height,
-                        fps,
-                        desc,
+                        Some((aligned_width, aligned_height, fps)),
+                        audio_bitrate_kbps.map(|_| (2, 48000)),
+                        audio_bitrate_kbps.unwrap_or(320) * 1000,
                     )
                     .map_err(|e| WinError::new(E_FAIL, format!("创建封装器失败: {e}")))?;
+                    muxer
+                        .set_video_description(desc)
+                        .map_err(|e| WinError::new(E_FAIL, format!("设置视频描述失败: {e}")))?;
                     let _ = subtype;
                     Some(RawPipeline {
                         sink,
@@ -670,6 +710,7 @@ impl GpuSinkWriter {
                 context: context.clone(),
                 sink_writer,
                 stream_index,
+                audio_stream_index,
                 cropped_texture,
                 converter,
                 width: aligned_width,
@@ -691,6 +732,8 @@ impl GpuSinkWriter {
     /// 样本从 MF 出来时是 **Annex B**（起始码分隔），这里做两件事：
     /// 1. 转成 MP4 要求的 4 字节长度前缀；
     /// 2. 丢掉参数集 NAL —— 它们已经在 `stsd` 的 `avcC`/`hvcC` 里了。
+    ///
+    /// 音频样本则保持裸 AAC 帧直接写入音轨。
     fn drain_raw(&mut self) -> WinResult<()> {
         let Some(raw) = self.raw.as_mut() else {
             return Ok(());
@@ -698,21 +741,67 @@ impl GpuSinkWriter {
         if let Some(err) = raw.sink.take_error() {
             return Err(WinError::new(E_FAIL, err));
         }
-        let samples = raw.sink.take_samples();
-        if samples.is_empty() {
+        let streams = raw.sink.take_streams();
+        if streams.is_empty() {
             return Ok(());
         }
         let hevc = raw.codec == GpuCodec::Hevc;
         let Some(muxer) = raw.muxer.as_mut() else {
             return Ok(());
         };
-        for s in samples {
-            let data = annexb_to_mp4_sample(&s.data, hevc);
-            muxer
-                .write_prefixed_sample(&data, s.pts_us, s.is_key)
-                .map_err(|e| WinError::new(E_FAIL, format!("写样本失败: {e}")))?;
+        for (_id, st) in streams {
+            match st.kind {
+                crate::encode::sink_raw::StreamKind::Video => {
+                    for s in st.samples {
+                        let data = annexb_to_mp4_sample(&s.data, hevc);
+                        muxer
+                            .write_video_sample(&data, s.pts_us, s.is_key)
+                            .map_err(|e| WinError::new(E_FAIL, format!("写视频样本失败: {e}")))?;
+                    }
+                }
+                crate::encode::sink_raw::StreamKind::Audio => {
+                    for s in st.samples {
+                        let pts_ticks = (s.pts_us as u128 * 48_000 / 1_000_000) as u64;
+                        muxer
+                            .write_audio_sample(&s.data, pts_ticks)
+                            .map_err(|e| WinError::new(E_FAIL, format!("写音频样本失败: {e}")))?;
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// 注入 CPU 内存中的双声道 48kHz 16-bit PCM 音频并编码送入 SinkWriter
+    pub fn push_audio_pcm(&mut self, pcm: &[u8], pts_us: u64) -> WinResult<()> {
+        let Some(audio_idx) = self.audio_stream_index else {
+            return Ok(());
+        };
+        if pcm.is_empty() {
+            return Ok(());
+        }
+        let frames = (pcm.len() / 4) as u32;
+        unsafe {
+            let media_buffer: IMFMediaBuffer = MFCreateMemoryBuffer(pcm.len() as u32)?;
+            let mut ptr = std::ptr::null_mut();
+            let mut max_len = 0u32;
+            let mut cur_len = 0u32;
+            media_buffer.Lock(&mut ptr, Some(&mut max_len), Some(&mut cur_len))?;
+            std::ptr::copy_nonoverlapping(pcm.as_ptr(), ptr, pcm.len());
+            media_buffer.Unlock()?;
+            media_buffer.SetCurrentLength(pcm.len() as u32)?;
+
+            let sample: IMFSample = MFCreateSample()?;
+            sample.AddBuffer(&media_buffer)?;
+
+            let sample_time = (pts_us as i64).saturating_mul(10);
+            let duration = (frames as i64 * 10_000_000 / 48_000).max(1);
+            sample.SetSampleTime(sample_time)?;
+            sample.SetSampleDuration(duration)?;
+
+            self.sink_writer.WriteSample(audio_idx, &sample)?;
+        }
+        self.drain_raw()
     }
 
     /// 核心调用：在显存内完成子区域裁剪并直接包装送入 GPU 编码器。
@@ -1129,6 +1218,7 @@ mod tests {
                     2000,
                     codec,
                     container,
+                    None,
                 ) {
                     Ok(s) => s,
                     Err(e) => {

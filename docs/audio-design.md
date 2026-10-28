@@ -19,7 +19,8 @@
 | `AUDIO_DEVICE` (2) | 同上，音源换成 `audio_device_id` 指定的渲染设备 |
 | `AUDIO_WINDOW` (3) | 同上，音源是 `audio_process_id` / `audio_window_hwnd` 对应进程树的输出 |
 
-音频轨固定参数：**AAC-LC、128 kbps、48000 Hz、2 声道、16 bit 输入**。
+音频轨参数：**AAC-LC、48000 Hz、2 声道、16 bit 输入**，码率由
+`audio_bitrate_kbps` 决定（默认 **320 kbps**，可选 96/128/160/192/256/320，见 §9.2）。
 
 四条编码路径的最终形态（音频在三条上都可用）：
 
@@ -39,6 +40,20 @@
 3. 录制中文件是合法 fMP4，崩溃只丢最后一个分片（视频或音频之一）。
 4. 停止后是普通 `ftyp/mdat/moov`，两条轨都在 `moov` 里。
 5. 任何时刻切片，产物带音轨，且切片内音画起点严格对齐。
+
+**实现阶段补上的三条硬约束**（都是踩过之后才写进来的，详见 §12）：
+
+6. **COM 套间（`ComApartment`）必须比同一线程上的所有 COM 对象活得更久。**
+   声明顺序决定析构顺序：守卫声明在最前，才最后析构。违反的后果不是报错，
+   而是 `CoUninitialize` 之后再 `Release` 一个 MFT/D3D 对象 → 进程当场
+   `STATUS_ACCESS_VIOLATION`，没有任何 Rust panic 可以先捕获。
+7. **静音补包的起表不能依赖「第一个真实数据包」。** 桌面完全静音时 WASAPI
+   loopback 可以一个包都不给；若 anchor 只在收到真实包时才建立，补包逻辑就
+   永远不会触发，音轨是 0 个样本。anchor 必须以录制起点 `t0` 起表，
+   首个真实包只用来做一次校正。
+8. **多故障级联时，报给宿主的必须是根因。** `last_error`（最新一条）会被下游
+   线程覆盖成派生结论（典型：「未捕获到任何帧」），真因（音频设备打不开）
+   就此丢失。所以另存一份只写一次的 `fatal_root`。
 
 ---
 
@@ -289,6 +304,36 @@ loop {
 **注意 `target` 用的是音频线程自己的起点，不是 `t0`。** 两者的差值在 muxer 里用
 `anchor_us` 统一，见 3.2。
 
+#### 4.5.1 起表时机：这个坑在实现阶段又踩了一次
+
+上面这段伪码有个致命前提没写出来：`produced_frames` 的比较对象必须是**已经起过表**的
+墙钟。而「起表」如果把条件写成「收到第一个真实包时才建 anchor」，整段逻辑就会在
+桌面完全静音时彻底失效：
+
+```
+真实包永远不来 → anchor 永远是 None → 补静音的分支被锚点判空跳过 → 音轨 0 样本
+```
+
+产物是一条**完全正常、只是没有声音**的 MP4：录制成功、停止成功、没有任何报错。
+
+正确的起表点就是录制起点 `t0`：
+
+```rust
+// t0 就绪后立刻起表，不等真实数据包
+if anchor_us.is_none() {
+    anchor_us = Some(0);
+    last_calib_qpc = t0_val;
+    wall = Instant::now();
+}
+```
+
+anchor 先置 0（= 音频与视频同起点），等**第一个真实包**到达时再做一次强制性校正：
+用它的 QPC 算出设备时钟的相位，与当前 `pts` 比较，偏差超过 2 ms 就整体平移 anchor。
+这样既保证了「静音也能起表」，又不会让设备时钟和墙钟之间的固有偏差一路累积。
+
+注意校正只动 `anchor_us`，**永远不动 `produced_frames`**——后者是 `stts` 长度的唯一
+来源，动它会让样本表与实际字节数脱节。
+
 ### 4.6 设备失效
 
 `GetNextPacketSize` / `GetBuffer` 返回 `AUDCLNT_E_DEVICE_INVALIDATED` 时，
@@ -298,6 +343,25 @@ loop {
 - 连续 10 次重建失败（间隔 500 ms，复用 `recorder.rs` 的 `REBUILD_INTERVAL`）→
   置致命错误 `REC_ERR_IO`，整条流水线停止，与视频设备丢失同一套处理。
 - 重建成功后**不重置** `total_frames`，只把新设备的首包 QPC 用于一次漂移校正。
+
+「重建期间继续补静音」不能靠 `sleep(500ms)` 蒙混过去——那样等于这半秒一帧音频都不出：
+
+```rust
+// 重建等待期间，按 5 ms 一轮持续补静音，直到 reset 完成
+while Instant::now() < deadline && !stop {
+    pad_silence(&wall, anchor_us, &mut produced_frames, &mut on_pcm)?;
+    sleep(5ms);
+}
+// 重建成功后把墙钟基准挪到「已产出帧数」对应的位置，
+// 否则下一轮会把重建期间补过的静音再补一遍。
+if reset().is_ok() {
+    wall = Instant::now() - Duration::from_micros(produced_frames * 1_000_000 / 48_000);
+}
+```
+
+不做这一步的后果是**静默的音画不同步**：切一次耳机，从那一刻起音频比画面短一块，
+播放器不会报任何错。这条缺陷在实现阶段真实存在过，是 `e2e_audio_timeline_matches_video_when_desktop_is_quiet`
+把它逼出来的。
 
 ---
 
@@ -362,7 +426,7 @@ MF_MT_AUDIO_NUM_CHANNELS                  = 2
 MF_MT_AUDIO_SAMPLES_PER_SECOND            = 48000
 MF_MT_AUDIO_BITS_PER_SAMPLE               = 16
 MF_MT_AUDIO_BLOCK_ALIGNMENT               = 4
-MF_MT_AUDIO_AVG_BYTES_PER_SECOND          = 16000        // 128 kbps / 8
+MF_MT_AUDIO_AVG_BYTES_PER_SECOND          = 40000        // = kbps * 1000 / 8；320 → 40000，128 → 16000
 MF_MT_AAC_PAYLOAD_TYPE                    = 0            // raw
 MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION  = 0x29         // AAC-LC
 ```
@@ -662,29 +726,56 @@ for (id, st) in sink.take_streams() {
 
 ## 9. 配置与 ABI
 
-**ABI 结构体不变，`RECORDER_ABI_VERSION` 不升。** 四个音频字段和四值枚举早已存在。
-
-`RecorderConfig` 的 C 定义无需改动：
+**ABI 升到 v2**（`RECORDER_ABI_VERSION = 2`）。相比 v1 只在尾部追加了
+`audio_bitrate_kbps` 一个字段，其余音频字段（`audio_source_type`、
+`audio_device_id`、`audio_window_hwnd`、`audio_process_id`）与四值枚举在 v1 就存在。
 
 ```c
 uint32_t audio_source_type;  /* AudioSourceType */
 const char* audio_device_id; /* AUDIO_DEVICE 时必填 */
 uint64_t audio_window_hwnd;  /* AUDIO_WINDOW 时用于解析 pid */
 uint32_t audio_process_id;   /* AUDIO_WINDOW 的首选 pid */
+uint32_t audio_bitrate_kbps; /* v2 新增：0=默认 320；96/128/160/192/256/320 */
 ```
 
-音频编码参数**写成常量，不开放配置**：128 kbps / 48000 Hz / 2 声道 / AAC-LC。
-理由：录屏场景这三个值没有调整需求（B 站上传也是这个量级），而任何尾部追加字段都必须
-升 `abi_version` 并破坏所有已编译宿主——不值得。
+### 9.1 为什么这条「尾部追加」必须升版本
 
-`recorder_get_stats` **不新增音频计数器**（同样避免 ABI 变更）。丢包/补静音走日志：
+设计初稿的判断是「尾部追加天然兼容、不必升」。这个判断是错的，纠正如下：
+
+`abi_version` 的契约是**已编译的旧宿主能继续安全调用新 dll**，不是「宿主和库一起重编译
+时结构体对得上」。旧宿主带着 v1 的 `RecorderConfig`（比 v2 短 4 字节）调进来，
+`from_ffi` 读到 `audio_process_id` 之后的那 4 字节时已经越过调用方实际分配的边界：
+
+- 最好情况：读到垃圾值 → 落在非法档位 → `REC_ERR_INVALID`，但错误信息是
+  「不支持的 audio_bitrate_kbps: 3735928559」，宿主完全看不懂，排查成本高；
+- 最坏情况：垃圾值凑巧是 96/128/160/192/256/320 之一 → 静默按错误码率编码；
+- 无论哪种，**越界读本身都是 UB**，只是恰好没崩。
+
+所以结论改成：**任何尾部追加都要升版本号**。让旧宿主拿到一句明确的
+「abi_version 不匹配：期望 2，实际 1」，宁可拒绝，不要 UB。升级成本只是 C# 侧
+`RecorderAbiVersion` 常量改一个数字（见 `docs/csharp-guide.md`）。
+
+这条规则已固化进 `include/recorder.h` 的注释和 `config.rs` 的单测
+（`abi_v1_is_rejected_with_actionable_message`，断言错误信息里同时出现期望值和实际值）。
+
+### 9.2 音频编码参数
+
+`audio_bitrate_kbps` 只接受 `0 | 96 | 128 | 160 | 192 | 256 | 320`，0 视为 320。
+采样率与声道数**写成常量，不开放配置**：48000 Hz / 2 声道 / AAC-LC。
+
+这两个值不开放的真正理由不是「避免 ABI 变更」（那条已经站不住了），而是：
+
+- 48 kHz 是 WASAPI 混音引擎的原生速率，改采样率只会凭空引入一次重采样；
+- 立体声是 loopback 的天然上限，声道数一变，`ASC` 常量（`[0x11, 0x90]`）和
+  `esds` 里的 `channelConfiguration` 全要跟着变，收益为零、出错面变大。
+
+`recorder_get_stats` **不新增音频计数器**（保持 `RecorderStats` 布局不变，
+因此本轮不需要再升 v3）。丢包/补静音走日志：
 
 ```
 [murec] 音频：补静音 120 ms（后台无音频渲染）
 [murec] 音频：队列溢出，丢弃 3 个包（共 64 ms）
 ```
-
-配置校验（`config.rs`）保持现状即可，仅把注释里的「M1 预留」改成实际语义。
 
 ---
 
@@ -730,7 +821,7 @@ H.264 同类的问题，已经栽过一次，设计上直接堵死。
 |---|---|
 | `e2e_audio_with_software_encoder` | 录 3 s + `Beep()`，MF 读回两条流，音频采样率 48000/2ch，时长差 < 50 ms |
 | `e2e_audio_with_gpu_encoder` | 同上，GPU 路径 |
-| `e2e_audio_silent_desktop` | 全程不发声，音频轨仍与视频等长（治静音补包） |
+| `e2e_audio_timeline_matches_video_when_desktop_is_quiet` | 音轨时间轴与视频轨差 ≤ 250 ms（治静音补包；桌面有声无声都成立） |
 | `e2e_audio_survives_slicing` | 录制中切片，产物带音轨且音画等长 |
 | `e2e_audio_device_invalidated_recovers` | 录制中切换默认设备，产物时间轴不断 |
 
@@ -750,18 +841,83 @@ reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, false)?;
 
 | 文件 | 动作 |
 |---|---|
-| `src/capture/wasapi.rs` | **新建**：`AudioCapture`（三种音源）、静音补包、设备重建、进程环回激活 |
+| `src/capture/wasapi.rs` | **新建**：`AudioCapture`（三种音源）、设备重建、进程环回激活 |
+| `src/com.rs` | **新建**：`ComApartment`，COM 套间的 RAII 守卫（解决 13.1 / 13.3） |
 | `src/capture/mod.rs` | `pub mod wasapi;` |
-| `src/encode/aac.rs` | **新建**：AAC MFT 驱动（同步 + 异步两种）、`ASC_48K_STEREO` 常量 |
+| `src/encode/aac.rs` | **新建**：AAC MFT 驱动（**只驱动同步 MFT**，异步的在枚举阶段就排除）、`ASC_48K_STEREO` 常量 |
 | `src/encode/mod.rs` | `pub mod aac;` |
 | `src/encode/sink_raw.rs` | `SinkState` 多流化、`AddStreamSink` 按 major type 分派 |
 | `src/encode/mf_sink.rs` | SinkWriter 加音频流、PCM 写入、`drain_raw` 按流分派 |
-| `src/mux/mp4.rs` | `TrackState` / `create_multi` / `build_audio_sample_entry` / `build_esds` / 双 `trex` |
-| `src/mux/extract.rs` | 双轨照抄与裁切 |
+| `src/mux/mp4.rs` | `TrackState` / `create_multi` / `build_audio_sample_entry` / `build_esds` / 双 `trex` / 音频 `pending` 上限 |
+| `src/mux/extract.rs` | 双轨照抄与裁切（音频起点跟关键帧、**终点跟视频真实结束点**） |
 | `src/mux/remux.rs` | 双轨重建（按 `tfhd.track_ID` 归轨） |
 | `src/mux/mod.rs` | 模块文档更新 |
-| `src/recorder.rs` | 音频线程、`MuxMsg::{Video,Audio}` 通道、去掉 122 行的拒绝、`RecorderStats` 不动 |
-| `src/config.rs` | 仅注释 |
-| `Cargo.toml` | 加 `"Win32_Media_Audio"` |
-| `include/recorder.h` | 注释文案（`M1 忽略` → 实际语义） |
+| `src/recorder.rs` | 音频线程、`MuxMsg::{Video,Audio}` 通道、`pad_silence`、`preflight_audio`、`fatal_root` |
+| `src/config.rs` | `ABI_VERSION` 1 → 2 + 版本历史说明 |
+| `tests/e2e_audio.rs` | **新建**：三个真录真解码的端到端用例 |
+| `Cargo.toml` | 加 `"Win32_Media_Audio"`（WASAPI）与 `"Win32_UI_WindowsAndMessaging"`（HWND → PID） |
+| `include/recorder.h` | ABI 升到 v2 + 变更记录 |
+| `docs/csharp-guide.md` | **新建**：C# 绑定与使用指南 |
 | `README.md` / `README.zh-CN.md` | 状态表、已知限制、路线图 |
+
+---
+
+## 13. 实现复盘：五个只有真跑起来才会暴露的缺陷
+
+设计稿把「盒结构怎么写」写得足够细，但下面这五个问题一条都不在图纸上——它们
+全部是靠 `tests/e2e_audio.rs`（真的录、真的用 MF 解码器读回）逼出来的。记在这里，
+因为每一条的**症状都比原因吓人**。
+
+### 13.1 COM 析构顺序：停止录制时进程直接消失
+
+| | |
+|---|---|
+| 症状 | `recorder_stop` 期间进程以 `STATUS_ACCESS_VIOLATION (0xC0000005)` 退出，没有任何 Rust panic、没有日志 |
+| 原因 | `CoUninitialize()` 写在了采集循环末尾，而这之后 `AacEncoder`（持有 `IMFTransform`）才被 drop。COM 套间已关闭的线程上 `Release` 一个 COM 对象 = 访问违例 |
+| 定位方法 | 在 `stop()` 的每次 `join` 前后打标记，发现崩在 join 音频/封装线程期间；再加细分标记才锁定到「音频线程退出时」 |
+| 修法 | 新增 `src/com.rs::ComApartment`（RAII）。**声明在最前 = 最后析构**，并用 `drop(aac_enc)` 显式表达「MFT 必须先于套间释放」。`gpu_recorder_thread` 里同样的隐患（形参 `gpu_sink`/`capture` 在 `CoUninitialize()` 之后才析构）一并改成守卫 |
+
+这条最容易再犯的地方是**新增任何持有 COM 对象的局部变量**：它必须声明在
+`ComApartment` 之后。这种「声明顺序即生命周期」的约束在 Rust 里没有编译器帮忙，
+只能在注释里写清楚。
+
+### 13.2 静音桌面 → 音轨 0 个样本
+
+见 §4.5.1。本质是「补静音的前置条件依赖了它本该替代的东西」。
+
+### 13.3 音频线程在 COM 未初始化的线程上建 MFT
+
+| | |
+|---|---|
+| 症状 | `AAC 编码器创建失败: 无法激活 AAC 编码器 MFT (0x80004005)` ——一个光秃秃的 `E_FAIL`，什么都没说 |
+| 原因 | `CoInitializeEx` 原本写在 `audio_capture_loop` 内部，而调用方在**进入这个函数之前**就要建 `AacEncoder`。`MFTEnumEx` 在没有 COM 的线程上照样能枚举成功，失败的是 `ActivateObject` |
+| 修法 | 套间初始化上移到线程入口（`ComApartment`），`audio_capture_loop` 改为由调用方负责 |
+
+值得记住的一点：**`MFTEnumEx` 成功不代表 COM 可用**。枚举和激活是两条完全不同的路径。
+
+### 13.4 级联故障把根因冲掉
+
+音频初始化失败 → 置 `stop` → 采集线程立刻退出 → 封装线程收尾时发现 0 样本 →
+报「录制期间未捕获到任何帧，画面可能完全无变化」。用户看到的是最后这句，
+于是去检查磁盘和画面，而真正的原因在别处。
+
+修法：`PipelineEnv` 增加只写一次的 `fatal_root`；`stop()` 和
+`recorder_get_last_error` 都优先返回根因。`last_error` 保留「最新一条」的语义给 UI。
+
+### 13.5 切片的音频**尾巴**超出视频结束点
+
+| | |
+|---|---|
+| 症状 | 切片可播放、两轨都在，但音频比视频长 0.24 s——片尾是「有声无画」 |
+| 原因 | 音频按入参 `end_us` 裁剪，而视频实际只能切到**最后一个已落盘分片**的末尾。两者不是同一个时刻 |
+| 修法 | 音频终点改为服从 `video_end_us = 最后一个保留视频样本的 dts + duration`。起点服从关键帧、终点服从视频，两端都由视频说了算 |
+| 回归 | `mux::extract::tests::audio_tail_is_clamped_to_video_end`（141 包 vs 未修时的 203 包） |
+
+### 13.6 顺带补上的两处
+
+- **ABI 版本**：加了 `audio_bitrate_kbps` 却仍是 v1。尾部追加在「宿主和库一起重编」时
+  安全，但 ABI 的契约是「已编译的旧宿主能继续用」——旧宿主结构体短 4 字节，会越界读。
+  已升到 v2，旧宿主拿到的是明确的「abi_version 不匹配」，不是 UB。
+- **音频 `pending` 无上限**：init moov 落盘前音频只进内存。视频首个关键帧迟迟不来时
+  会无限增长。加 2 秒（94 包）上限，超出丢最旧的包，时间轴由 `stts` 按真实 tick 计算，
+  不受影响。

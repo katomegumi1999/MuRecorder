@@ -12,8 +12,8 @@
 //! - 样本时间戳来自 QPC，成片时长与墙钟一致（帧序号时间戳会在这里暴露）；
 //! - 软编与硬编两条路径产出同构的、可解码的文件。
 
-use recorder_core::config::{AudioSourceType, EncoderPreference, RecordingConfig};
-use recorder_core::recorder::Recorder;
+use murecorder_core::config::{AudioSourceType, EncoderPreference, RecordingConfig};
+use murecorder_core::recorder::Recorder;
 use std::time::Duration;
 use windows::Win32::Media::MediaFoundation::{
     IMFMediaType, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
@@ -40,6 +40,7 @@ fn recording_config(path: &str, encoder: EncoderPreference) -> RecordingConfig {
         audio_device_id: None,
         audio_window_hwnd: 0,
         audio_process_id: 0,
+        audio_bitrate_kbps: 320,
     }
 }
 
@@ -188,10 +189,10 @@ fn e2e_gpu_encoder() {
 #[test]
 #[ignore = "需要 Media Foundation；用 --ignored 手动运行"]
 fn e2e_slice_from_recording_is_playable() {
-    use recorder_core::convert::i420::bgra_to_i420;
-    use recorder_core::encode::VideoEncoder;
-    use recorder_core::mux::extract::extract_range;
-    use recorder_core::mux::mp4::Mp4Muxer;
+    use murecorder_core::convert::i420::bgra_to_i420;
+    use murecorder_core::encode::VideoEncoder;
+    use murecorder_core::mux::extract::extract_range;
+    use murecorder_core::mux::mp4::Mp4Muxer;
 
     const W: u32 = 320;
     const H: u32 = 240;
@@ -292,8 +293,8 @@ fn e2e_slice_from_recording_is_playable() {
 #[test]
 #[ignore = "需要真实 GPU 硬件编码器与桌面会话（本地手动验证）"]
 fn e2e_slice_gpu_recording_while_running() {
-    use recorder_core::mux::extract::extract_range;
-    use recorder_core::stats::ENCODER_SOFT_OPENH264;
+    use murecorder_core::mux::extract::extract_range;
+    use murecorder_core::stats::ENCODER_SOFT_OPENH264;
 
     let dir = std::env::temp_dir().join("murecorder_e2e");
     std::fs::create_dir_all(&dir).unwrap();
@@ -384,7 +385,7 @@ fn e2e_slice_gpu_recording_while_running() {
 #[test]
 #[ignore = "需要支持 HEVC 硬编的 GPU 与桌面会话（本地手动验证）"]
 fn e2e_hevc_records_when_explicitly_requested() {
-    use recorder_core::stats::ENCODER_GPU_HEVC;
+    use murecorder_core::stats::ENCODER_GPU_HEVC;
 
     let dir = std::env::temp_dir().join("murecorder_e2e");
     std::fs::create_dir_all(&dir).unwrap();
@@ -491,7 +492,7 @@ fn e2e_hevc_records_when_explicitly_requested() {
 #[test]
 #[ignore = "需要真实 GPU 硬件编码器与桌面会话（本地手动验证）"]
 fn e2e_gpu_recording_finalizes_to_plain_mp4() {
-    use recorder_core::stats::ENCODER_SOFT_OPENH264;
+    use murecorder_core::stats::ENCODER_SOFT_OPENH264;
 
     let dir = std::env::temp_dir().join("murecorder_e2e");
     std::fs::create_dir_all(&dir).unwrap();

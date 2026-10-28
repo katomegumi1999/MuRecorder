@@ -34,10 +34,10 @@ Most "record the screen from Rust" tutorials stop at `AcquireNextFrame`. The har
 | GPU encode: H.264 / HEVC / AV1 via Media Foundation SinkWriter | ✅ |
 | GPU color conversion BGRA → NV12 via `ID3D11VideoProcessor` | ✅ |
 | CPU encode: OpenH264 (pure Rust, statically linked), BT.709 BGRA → I420 | ✅ |
-| MP4 muxing (CPU path): Hybrid (crash-safe fMP4 → plain MP4 at stop), 64-bit `mdat` largesize, `co64`, `colr`, single video track | ✅ |
+| MP4 muxing (CPU path): Hybrid (crash-safe fMP4 → plain MP4 at stop), 64-bit `mdat` largesize, `co64`, `colr`, dual audio/video tracks | ✅ |
 | GPU path: fragmented output + soft remux to a plain MP4 at stop | ✅ (H.264 uses MF's fragmented sink; HEVC uses our own sink; AV1 lands as plain MP4) |
-| Custom `IMFMediaSink` (encode via `IMFSinkWriter`, mux our own boxes) | ✅ |
-| Range extraction while recording (zero re-encode, plain MP4 out) | ✅ |
+| Custom `IMFMediaSink` (encode via `IMFSinkWriter`, mux our own boxes: `avcC` / `hvcC` / `mp4a`) | ✅ |
+| Range extraction while recording (zero re-encode, keyframe aligned audio/video, plain MP4 out) | ✅ |
 | Cut an arbitrary time range out of a live recording (`recorder_extract_range`) | ✅ |
 | Codec-agnostic range extraction (H.264 / HEVC / AV1 — `stsd` copied verbatim) | ✅ |
 | Encoder ladder: (codec × container) candidates, HEVC/own-fragment → H.264/fragment → plain MP4 → software | ✅ |
@@ -46,8 +46,8 @@ Most "record the screen from Rust" tutorials stop at `AcquireNextFrame`. The har
 | Thread-safe handle (concurrent `stop` + `get_stats` from different threads) | ✅ |
 | Recordings larger than 4 GiB in a single file (64-bit `mdat` + `co64` on the fragmented paths; the AV1 plain path upgrades `co64` only and reports an `mdat`-header risk honestly) | ✅ |
 | Lock-free frame counters, 200 ms sampled snapshot | ✅ |
+| Audio recording (WASAPI loopback default / specific device, process tree loopback, AAC-LC 320k stereo) | ✅ |
 | Cursor compositing | ❌ not yet |
-| Audio (WASAPI loopback / per-process loopback) | ❌ not yet |
 | HDR / wide-gamut capture | ❌ SDR only |
 
 ## Requirements
@@ -60,10 +60,12 @@ Most "record the screen from Rust" tutorials stop at `AcquireNextFrame`. The har
 
 ```bash
 cargo build --release
-# → target/release/recorder_core.dll  (+ recorder_core.lib if you want to link C)
+# → target/release/murecorder_core.dll  (+ murecorder_core.lib if you want to link C)
 ```
 
-Drop `recorder_core.dll` next to your executable. The C header is [`include/recorder.h`](include/recorder.h).
+Drop `murecorder_core.dll` next to your executable.
+- C header: [`include/recorder.h`](include/recorder.h)
+- Full C# integration guide & examples: [`docs/csharp-guide.md`](docs/csharp-guide.md)
 
 Minimal C# consumer (abridged — see the header for the full contract):
 
@@ -81,28 +83,29 @@ struct RecorderConfig
     public uint BitrateKbps;
     public uint CaptureCursor;
     [MarshalAs(UnmanagedType.LPUTF8Str)] public string OutputPath;
-    public uint AudioSourceType;                // must be 0 (audio is not implemented yet)
+    public uint AudioSourceType;                // 0 = none, 1 = system, 2 = device, 3 = window
     [MarshalAs(UnmanagedType.LPUTF8Str)] public string? AudioDeviceId;
     public ulong AudioWindowHwnd;
     public uint AudioProcessId;
+    public uint AudioBitrateKbps;               // 0 = default (320k), supports 96/128/160/192/256/320
 }
 
 static partial class Native
 {
-    [LibraryImport("recorder_core", EntryPoint = "recorder_create")]
+    [LibraryImport("murecorder_core", EntryPoint = "recorder_create")]
     internal static partial int Create(ref RecorderConfig cfg, out IntPtr handle);
 
-    [LibraryImport("recorder_core", EntryPoint = "recorder_start")]
+    [LibraryImport("murecorder_core", EntryPoint = "recorder_start")]
     internal static partial int Start(IntPtr handle);
 
-    [LibraryImport("recorder_core", EntryPoint = "recorder_stop")]
+    [LibraryImport("murecorder_core", EntryPoint = "recorder_stop")]
     internal static partial int Stop(IntPtr handle);
 
-    [LibraryImport("recorder_core", EntryPoint = "recorder_destroy")]
+    [LibraryImport("murecorder_core", EntryPoint = "recorder_destroy")]
     internal static partial void Destroy(IntPtr handle);
 
     // Cut [startUs, endUs) out of a *live* recording into a standalone MP4.
-    [LibraryImport("recorder_core", EntryPoint = "recorder_extract_range")]
+    [LibraryImport("murecorder_core", EntryPoint = "recorder_extract_range")]
     internal static partial int ExtractRange(
         [MarshalAs(UnmanagedType.LPUTF8Str)] string src,
         [MarshalAs(UnmanagedType.LPUTF8Str)] string dst,
@@ -224,7 +227,7 @@ The GPU path skips this entirely. Numbers include three per-frame `Vec` allocati
 - **The handle is a `Mutex<Recorder>`.** The host is allowed to poll `get_stats` from the UI thread while another thread calls `stop`; handing out `&mut Recorder` from a raw pointer would be undefined behaviour.
 - **`co64` *and* a 64-bit `mdat`.** 32-bit chunk offsets die at 4 GiB, and so does a 32-bit box size — offsets alone are not enough. `mdat` uses `size == 1` + largesize (ISO/IEC 14496-12 §4.2), verified to be read back correctly by Media Foundation's own MP4 parser.
 - **`mdhd` is version 1.** With a microsecond timescale, a 32-bit duration caps correct reporting at 71 minutes; streaming a two-hour session would wrap the duration field.
-- **Sample timestamps come from QPC, never from a frame counter.** Generating `frame_count × frame_interval` compresses the timeline whenever the pipeline falls behind (a 60 s capture plays in 20 s), and guarantees A/V drift once audio lands.
+- **Sample timestamps come from QPC, never from a frame counter.** Generating `frame_count × frame_interval` compresses the timeline whenever the pipeline falls behind (a 60 s capture plays in 20 s). Audio inherits the same rule: its PTS is derived from the *cumulative sample count* (strictly constant rate), and QPC is used only to establish and periodically correct the anchor.
 - **The reservation trick was measured and dropped.** An earlier revision reserved ~1.7 MB of `free` space at the head of every file so `moov` could be written into it at stop time (faststart without moving data). That is a fixed cost on *every* recording: a 5-second 1080p clip grew by 46 %, while the `moov` it was making room for is only ~4 KB. The 16-byte `free` box now exists only as a placeholder to be rewritten into an `mdat` header.
 - **faststart is deliberately not implemented.** `moov` ends up after `mdat` in the finalized file. That costs nothing for local playback (every player seeks to the tail), nothing for upload-and-transcode platforms (YouTube/Bilibili parse the whole file server-side), and only matters for progressive web playback — which is better served by a one-off `ffmpeg -movflags +faststart` pass than by a per-file reservation.
 - **Failing to finalize must not destroy footage.** If `moov` cannot be written, the recording is renamed to `<name>.mp4.partial` instead of being deleted. Since the file is still a valid fragmented MP4 up to the last complete fragment, it plays as-is and can be remuxed with `ffmpeg -i x.mp4.partial -c copy fixed.mp4` — no `untrunc` reference clip required.
@@ -265,11 +268,13 @@ cargo test --lib -- --ignored --nocapture   # real SinkWriter: every codec × co
 `pipeline_encodes_synthetic_frames_into_valid_mp4` drives the real encoder and the real muxer with synthetic frames and validates the resulting box tree — deterministic, no desktop session needed.
 
 `tests/e2e_record.rs` records 2 seconds of the actual screen and reads the file back with Media Foundation's own MP4 parser, checking frame count, dimensions and timeline length. It is `#[ignore]`d because it needs a desktop, but it is the only test that proves the container is acceptable to a *real* demuxer. Several more cases cover the GPU writer: `e2e_gpu_recording_finalizes_to_plain_mp4` asserts the container collapses to `ftyp`/`mdat`/`moov` and that Media Foundation accepts the rebuilt index; `e2e_slice_gpu_recording_while_running` cuts a range **while the file is still being written** and then checks both the slice and the untouched recording (AV1 is the only exception: it does refuse, and the assertion pins down that the reason is stated clearly, so the case never silently skips); `e2e_hevc_records_when_explicitly_requested` proves HEVC goes through the custom sink — the file already contains `moof` with a `mvex`-bearing `moov` **while recording**, and after stop the `moov` no longer has `mvex` while `hvc1` really is present, rather than a silent H.264 downgrade. `e2e_slice_from_recording_is_playable` does the CPU-path equivalent.
+`tests/e2e_audio.rs` covers the audio side with the same philosophy: `e2e_audio_with_software_encoder` records real system audio and then hands the track to Media Foundation's **AAC decoder**, so a wrong `esds`/`AudioSpecificConfig` fails there instead of in the player; `e2e_audio_timeline_matches_video_when_desktop_is_quiet` asserts the two tracks stay within 250 ms of each other (on a silent desktop the only way that holds is the wall-clock-driven silence padding working); `e2e_audio_survives_slicing` cuts a range mid-recording and requires the slice to carry **both** tracks with the audio aligned to the video keyframe on the way in and clamped to the video's real end on the way out.
 
 ## Known limitations
 
 - The mouse cursor is **not** composited into the recording. `capture_cursor` is accepted and ignored.
-- Audio is not implemented; `audio_source != 0` is rejected at `create`.
+- **Audio is AAC-LC only**, 48 kHz / stereo, and the bitrate is limited to the six tiers in `audio_bitrate_kbps` (96/128/160/192/256/320 kbps). There is no resampling option: 48 kHz is the WASAPI mix-engine rate, so anything else would only add a conversion.
+- The audio track is decoded and checked end-to-end on every `cargo test --test e2e_audio -- --ignored` run, including a real Media Foundation AAC decode (a mismatched `esds`/ASC fails there rather than in the player).
 - HDR desktops are captured as SDR BGRA8 and will look flattened.
 - **The finalized file is not faststart** (`moov` sits after `mdat`). Irrelevant for local playback and for upload-then-transcode sites; if you need progressive web playback, run `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4` once afterwards.
 - **Range extraction needs a *fragmented* file, not a particular codec.** The sample description is copied verbatim and the index carries no codec-specific fields, so codec choice never enters the picture. What it does need is the fragmented recording state (`moof` boxes carrying their own sample tables). Software encode, GPU H.264 and GPU HEVC all record that way, so they can be sliced **while recording**. Only GPU AV1 cannot — it falls back to a plain MP4 with `moov` written at stop, and `recorder_extract_range` returns a clear `REC_ERR_IO` explaining that instead of emitting garbage.
@@ -281,10 +286,9 @@ cargo test --lib -- --ignored --nocapture   # real SinkWriter: every codec × co
 ## Roadmap
 
 1. Cursor compositing from `DXGI_OUTDUPL_FRAME_INFO.PointerPosition`.
-2. WASAPI loopback audio + AAC track in the MP4, QPC-aligned with video.
-3. Buffer pooling and SIMD in the conversion path (4K currently costs ~half a core).
-4. Pause/resume and hot region change while recording.
-5. Fragmented muxing for AV1 (`av1C` + OBU samples), to bring crash safety and
+2. Buffer pooling and SIMD in the conversion path (4K currently costs ~half a core).
+3. Pause/resume and hot region change while recording.
+4. Fragmented muxing for AV1 (`av1C` + OBU samples), to bring crash safety and
    mid-recording slicing to the last remaining codec.
 
 ## License

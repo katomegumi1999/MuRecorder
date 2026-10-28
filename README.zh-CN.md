@@ -34,10 +34,10 @@ DXGI Desktop Duplication 采集 → Media Foundation 硬件编码（H.264 / HEVC
 | GPU 编码：H.264 / HEVC / AV1（Media Foundation SinkWriter） | ✅ |
 | GPU 色彩转换 BGRA → NV12（`ID3D11VideoProcessor`） | ✅ |
 | CPU 编码：OpenH264（纯 Rust，静态链接），BT.709 BGRA → I420 | ✅ |
-| MP4 封装（软编路径）：Hybrid（录制中崩溃安全，停止时转普通 MP4）、64 位 `mdat` largesize、`co64`、`colr`、单视频轨 | ✅ |
+| MP4 封装（软编路径）：Hybrid（录制中崩溃安全，停止时转普通 MP4）、64 位 `mdat` largesize、`co64`、`colr`、双音视频轨 | ✅ |
 | GPU 路径：分片输出 + 停止时 soft remux 成普通 MP4 | ✅（H.264 用 MF 自带 sink；HEVC 用自研 sink；AV1 只能落普通 MP4） |
-| 自研 `IMFMediaSink`：编码器交给 MF、写盒归自己（`avcC` / `hvcC`） | ✅ |
-| 录制中区间切片（零重编码，产物是普通 MP4） | ✅ |
+| 自研 `IMFMediaSink`：编码器交给 MF、写盒归自己（`avcC` / `hvcC` / `mp4a`） | ✅ |
+| 录制中区间切片（零重编码，音视频关键帧对齐，产物是普通 MP4） | ✅ |
 | 从录制中的文件切出任意时间区间（`recorder_extract_range`） | ✅ |
 | 与编码器无关的区间切片（H.264 / HEVC / AV1，`stsd` 原样照抄） | ✅ |
 | 编码器阶梯：（编码器 × 容器）候选，HEVC/自研分片 → H.264/分片 → 普通 MP4 → 软件 | ✅ |
@@ -46,8 +46,8 @@ DXGI Desktop Duplication 采集 → Media Foundation 硬件编码（H.264 / HEVC
 | 线程安全句柄（一线程 stop、另一线程轮询 stats） | ✅ |
 | 单文件录制超过 4 GiB（分片路径为 64 位 `mdat` + `co64`；AV1 普通 MP4 只能升级 `co64`，`mdat` 头超限会如实上报） | ✅ |
 | 无锁帧计数 + 200 ms 采样快照 | ✅ |
+| 音频录制（WASAPI loopback 默认设备 / 指定设备，进程树环回，AAC-LC 320k 双声道） | ✅ |
 | 鼠标指针合成 | ❌ 未实现 |
-| 音频（WASAPI loopback / 进程环回） | ❌ 未实现 |
 | HDR / 广色域采集 | ❌ 仅 SDR |
 
 ## 环境要求
@@ -60,10 +60,12 @@ DXGI Desktop Duplication 采集 → Media Foundation 硬件编码（H.264 / HEVC
 
 ```bash
 cargo build --release
-# → target/release/recorder_core.dll
+# → target/release/murecorder_core.dll
 ```
 
-把 `recorder_core.dll` 放到可执行文件旁。C 头文件见 [`include/recorder.h`](include/recorder.h)。
+把 `murecorder_core.dll` 放到可执行文件旁。
+- C 头文件：[`include/recorder.h`](include/recorder.h)
+- 详细 C# 调用文档与完整示例：[`docs/csharp-guide.md`](docs/csharp-guide.md)
 
 ```csharp
 [StructLayout(LayoutKind.Sequential)]
@@ -77,10 +79,11 @@ struct RecorderConfig
     public uint BitrateKbps;
     public uint CaptureCursor;
     [MarshalAs(UnmanagedType.LPUTF8Str)] public string OutputPath;
-    public uint AudioSourceType;                // 必须为 0（音频尚未实现）
+    public uint AudioSourceType;                // 0=none, 1=system, 2=device, 3=window
     [MarshalAs(UnmanagedType.LPUTF8Str)] public string? AudioDeviceId;
     public ulong AudioWindowHwnd;
     public uint AudioProcessId;
+    public uint AudioBitrateKbps;               // 0=默认(320k), 支持 96/128/160/192/256/320
 }
 
 if (Native.Create(ref cfg, out var h) != 0) throw new Exception("create failed");
@@ -187,7 +190,7 @@ GPU 路径完全绕过这一步。上述数字含每帧 3 次 `Vec` 分配；引
 - **句柄是 `Mutex<Recorder>`。** 宿主可以在 UI 线程轮询 stats 的同时从另一线程 stop；若像早期实现那样直接把裸指针转成 `&mut Recorder`，就是未定义行为。
 - **`co64` 还不够，`mdat` 也要 64 位。** 32 位 chunk 偏移在 4 GiB 处断裂，32 位盒长同样会——只修偏移救不了盒长。`mdat` 使用 `size == 1` + largesize（ISO/IEC 14496-12 §4.2），已用 Media Foundation 自带 MP4 解析器读回验证。
 - **`mdhd` 用 version 1。** 微秒 timescale 配 32 位时长，正确上报的上限只有 71 分钟；录两小时时长字段会回绕。
-- **样本时间戳只取 QPC，绝不用帧序号。** `frame_count × 帧间隔` 会在流水线跟不上时把时间轴压扁（60 秒实录播成 20 秒），接入音频后必然音画不同步。
+- **样本时间戳只取 QPC，绝不用帧序号。** `frame_count × 帧间隔` 会在流水线跟不上时把时间轴压扁（60 秒实录播成 20 秒）。音频沿用同一条规则，但更严格：它的 PTS 由**累计采样数**推算（严格恒速），QPC 只用来建 anchor 和定期校正。
 - **预留方案是量化后主动放弃的。** 早期版本在每个文件头预留约 1.7 MB 的 `free`，好让 `moov` 停止时原地写入（不搬数据就 faststart）。这是**每个文件**的固定开销：5 秒 1080p 短片因此膨胀 46%，而它腾位置的那个 `moov` 只有约 4 KB。现在 16 字节的 `free` 只是占位，唯一用途是被改写成 `mdat` 头。
 - **faststart 是刻意不做的。** 成品里 `moov` 在 `mdat` 之后。本地播放无损（播放器都会跳到文件尾），上传后由平台转码的场景也无损（YouTube/B 站在服务端解析整个文件），只影响网页边下边播——那个场景用一次性的 `ffmpeg -movflags +faststart` 处理，比给每个文件预留空间划算得多。
 - **收尾失败不许毁素材。** `moov` 写不出来时把文件改名为 `<name>.mp4.partial` 保留，而不是删除。因为到最后一个完整分片为止它仍是合法 fMP4，能直接播，也能用 `ffmpeg -i x.mp4.partial -c copy fixed.mp4` 转成正常 MP4——不需要 `untrunc` 那套同源样本修复。
@@ -230,7 +233,8 @@ cargo test --lib -- --ignored --nocapture   # 真实 SinkWriter：每个编码�
 ## 已知限制
 
 - 鼠标指针**不会**出现在录像里。`capture_cursor` 被接受但被忽略。
-- 音频未实现；`audio_source != 0` 在 `create` 阶段即被拒绝。
+- **音频只有 AAC-LC**，48 kHz / 双声道，码率限定在 `audio_bitrate_kbps` 的六档（96/128/160/192/256/320 kbps）里。采样率不开放：48 kHz 是 WASAPI 混音引擎的原生速率，换别的只会平白多一次重采样。
+- 音轨会被**真的解码一遍**再判定（`cargo test --test e2e_audio -- --ignored`）：`esds`/ASC 与码流不符会在这里失败，而不是等播放器表现为「有轨无声」。
 - HDR 桌面按 SDR BGRA8 采集，画面会被压平。
 - **成品不是 faststart**（`moov` 在 `mdat` 之后）。本地播放和「上传后由平台转码」都无感；真要网页直链边下边播，事后跑一次 `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4`。
 - **区间切片要求文件处于分片态，与编码器无关。** 前提是文件里有 `moof`（每片自带样本表）。软编、GPU H.264、GPU HEVC 都是这么写的，所以**录制中即可切**；只有 GPU AV1 不是——它退回普通 MP4，`moov` 要到停止录制才写，此时 `recorder_extract_range` 返回 `REC_ERR_IO` 并说明原因，而不是产出垃圾。
@@ -242,10 +246,9 @@ cargo test --lib -- --ignored --nocapture   # 真实 SinkWriter：每个编码�
 ## 路线图
 
 1. 从 `DXGI_OUTDUPL_FRAME_INFO.PointerPosition` 合成鼠标指针。
-2. WASAPI loopback 音频 + MP4 内 AAC 轨，与视频 QPC 对齐。
-3. 转换路径引入缓冲池与 SIMD（4K 目前要吃掉半个核心）。
-4. 暂停/恢复、录制中热改区域。
-5. AV1 的自研分片封装（`av1C` + OBU 样本），把崩溃安全与录制中切片补齐到最后一种编码器。
+2. 转换路径引入缓冲池与 SIMD（4K 目前要吃掉半个核心）。
+3. 暂停/恢复、录制中热改区域。
+4. AV1 的自研分片封装（`av1C` + OBU 样本），把崩溃安全与录制中切片补齐到最后一种编码器。
 
 ## 许可
 

@@ -14,7 +14,7 @@ $ErrorActionPreference = "Stop"
 
 $coreDir = Split-Path -Parent $PSScriptRoot
 $destDir = Join-Path $ShawMuOCRDir "Libs\x64"
-$dllName = "recorder_core.dll"
+$dllName = "murecorder_core.dll"
 
 if (-not (Test-Path (Join-Path $ShawMuOCRDir "ShawMuOCR.csproj"))) {
     throw "ShawMuOCRDir 不像主工程根目录（找不到 ShawMuOCR.csproj）: $ShawMuOCRDir"

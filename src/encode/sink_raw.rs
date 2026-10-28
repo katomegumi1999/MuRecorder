@@ -51,6 +51,7 @@
 //!   `all(Com_StructuredStorage, System_Variant)` 门控（签名里有 `PROPVARIANT`），
 //!   少了这两个 feature 连 trait 都看不见。
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::E_POINTER;
@@ -77,9 +78,17 @@ fn trace_on() -> bool {
 }
 
 /// 收到的一个编码样本。
+/// 流类型：视频或音频。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Video,
+    Audio,
+}
+
+/// 收到的一个编码样本。
 #[derive(Debug, Clone)]
 pub struct EncodedSample {
-    /// 编码后的码流字节（**原样**，未做 Annex B → 长度前缀转换）
+    /// 编码后的码流字节（原样，视频未做 Annex B → 长度前缀转换，音频为裸 AAC 帧）
     pub data: Vec<u8>,
     /// 显示时间（微秒，相对录制起点）
     pub pts_us: u64,
@@ -87,20 +96,22 @@ pub struct EncodedSample {
     pub is_key: bool,
 }
 
+/// 单条流的状态。
+#[derive(Debug, Clone)]
+pub struct StreamState {
+    pub identifier: u32,
+    pub kind: StreamKind,
+    pub subtype: GUID,
+    pub sequence_header: Vec<u8>,
+    pub frame_size: Option<(u32, u32)>,
+    pub samples: Vec<EncodedSample>,
+}
+
 /// 全部 COM 对象共享的状态（只存纯数据，避免跨线程持有 COM 指针）。
 #[derive(Default)]
 struct SinkState {
-    /// `stsd` 需要的参数集（`avcC` / `hvcC` / `av1C` 的盒体）
-    sequence_header: Vec<u8>,
-    /// 协商出来的编码格式（用来决定写 `avc1` / `hvc1` / `av01`）
-    subtype: Option<GUID>,
-    /// 编码后样本的宽高
-    frame_size: Option<(u32, u32)>,
-    /// 收集到的样本（由上层定时取走并写盘）
-    samples: Vec<EncodedSample>,
-    /// 已经写过的样本数（用于统计，不受取走影响）
-    total: u64,
-    /// 参数集被更新过几次（编码器可能中途重发，方便上层判断要不要重写 `stsd`）
+    streams: HashMap<u32, StreamState>,
+    total_samples: u64,
     header_revisions: u32,
     shut_down: bool,
     error: Option<String>,
@@ -122,18 +133,12 @@ impl RawMediaSink {
     /// 创建 sink。`video_types` 是我们愿意接受的编码输出格式（H.264 / HEVC / AV1）。
     pub fn new(video_types: &[&GUID]) -> WinResult<Self> {
         let state = Arc::new(Mutex::new(SinkState::default()));
-        let queue: IMFMediaEventQueue = unsafe { MFCreateEventQueue()? };
         // 父子互相引用会造成循环；这里用一个「槽」先占位，等父对象建好再填。
-        //
-        // 刻意用 `Arc` 而不是 `Rc`：这些 COM 对象的接口方法会被 MF 的工作线程
-        // 调用，引用计数必须是原子的。clippy 报警只是因为 windows-rs 没给 COM
-        // 接口类型标 `Send`/`Sync`（它无法判断），而它们实际都是进程内自由线程对象。
         #[allow(clippy::arc_with_non_send_sync)]
         let parent_slot: Arc<Mutex<Option<IMFMediaSink>>> = Arc::new(Mutex::new(None));
 
         let media_sink: IMFMediaSink = RawMediaSinkImpl {
             state: state.clone(),
-            queue,
             accepted: video_types.iter().map(|g| **g).collect(),
             parent: parent_slot.clone(),
             #[allow(clippy::arc_with_non_send_sync)]
@@ -155,21 +160,49 @@ impl RawMediaSink {
         &self.sink
     }
 
-    /// 取走攒下的样本（写盘后调用，避免无限增长）。
+    /// 取走所有流中攒下的样本（写盘后调用，避免无限增长）。
+    pub fn take_streams(&self) -> HashMap<u32, StreamState> {
+        let mut s = SinkState::lock(&self.state);
+        let mut result = HashMap::new();
+        for (&id, stream) in s.streams.iter_mut() {
+            let mut st = stream.clone();
+            st.samples = std::mem::take(&mut stream.samples);
+            result.insert(id, st);
+        }
+        result
+    }
+
+    /// 取走攒下的样本（单视频流兼容接口）。
     pub fn take_samples(&self) -> Vec<EncodedSample> {
         let mut s = SinkState::lock(&self.state);
-        std::mem::take(&mut s.samples)
+        if let Some(stream) = s
+            .streams
+            .values_mut()
+            .find(|st| st.kind == StreamKind::Video)
+        {
+            std::mem::take(&mut stream.samples)
+        } else if let Some(first) = s.streams.values_mut().next() {
+            std::mem::take(&mut first.samples)
+        } else {
+            Vec::new()
+        }
     }
 
     /// 当前攒着但还没取走的样本数。
     pub fn pending_samples(&self) -> usize {
-        SinkState::lock(&self.state).samples.len()
+        let s = SinkState::lock(&self.state);
+        s.streams.values().map(|st| st.samples.len()).sum()
     }
 
     /// `stsd` 需要的参数集（`avcC` / `hvcC` / `av1C` 盒体）。可能一开始为空，
     /// 编码器产出第一个关键帧后才有。
     pub fn sequence_header(&self) -> Vec<u8> {
-        SinkState::lock(&self.state).sequence_header.clone()
+        let s = SinkState::lock(&self.state);
+        s.streams
+            .values()
+            .find(|st| st.kind == StreamKind::Video)
+            .map(|st| st.sequence_header.clone())
+            .unwrap_or_default()
     }
 
     /// 参数集被改写过几次（>1 说明编码器中途重发了参数集）。
@@ -177,18 +210,26 @@ impl RawMediaSink {
         SinkState::lock(&self.state).header_revisions
     }
 
-    /// 协商出来的编码格式。
+    /// 协商出来的视频编码格式。
     pub fn subtype(&self) -> Option<GUID> {
-        SinkState::lock(&self.state).subtype
+        let s = SinkState::lock(&self.state);
+        s.streams
+            .values()
+            .find(|st| st.kind == StreamKind::Video)
+            .map(|st| st.subtype)
     }
 
-    /// 编码后样本的宽高。
+    /// 编码后视频样本的宽高。
     pub fn frame_size(&self) -> Option<(u32, u32)> {
-        SinkState::lock(&self.state).frame_size
+        let s = SinkState::lock(&self.state);
+        s.streams
+            .values()
+            .find(|st| st.kind == StreamKind::Video)
+            .and_then(|st| st.frame_size)
     }
 
     pub fn total_samples(&self) -> u64 {
-        SinkState::lock(&self.state).total
+        SinkState::lock(&self.state).total_samples
     }
 
     pub fn take_error(&self) -> Option<String> {
@@ -198,11 +239,15 @@ impl RawMediaSink {
 
 // ------------------------------------------------------------ 类型处理器
 
+// ------------------------------------------------------------ 类型处理器
+
 /// 告诉 SinkWriter「这些编码格式我能写」。每条流一个。
 #[implement(IMFMediaTypeHandler)]
 struct RawTypeHandler {
     state: Arc<Mutex<SinkState>>,
-    /// 接受的编码子类型（H.264 / HEVC / AV1）
+    identifier: u32,
+    kind: StreamKind,
+    /// 接受的编码子类型（视频为 H.264 / HEVC / AV1，音频为 AAC）
     accepted: Vec<GUID>,
     /// `SetCurrentMediaType` 设进来的输出类型，`GetCurrentMediaType` 要原样还回去
     current: Mutex<Option<IMFMediaType>>,
@@ -214,27 +259,34 @@ impl IMFMediaTypeHandler_Impl for RawTypeHandler_Impl {
         pmediatype: windows::core::Ref<IMFMediaType>,
         ppmediatype: windows::core::OutRef<IMFMediaType>,
     ) -> WinResult<()> {
-        // ppmediatype 是「最接近的支持类型」的回传位；我们不提供建议。
         let _ = ppmediatype.write(None);
         let Some(mt) = pmediatype.as_ref() else {
             return Err(windows::core::Error::from_hresult(E_POINTER));
         };
-        let major = unsafe { mt.GetGUID(&MF_MT_MAJOR_TYPE) };
-        if major.map(|g| g != MFMediaType_Video).unwrap_or(true) {
+        let major = unsafe { mt.GetGUID(&MF_MT_MAJOR_TYPE) }?;
+        let expected_major = match self.kind {
+            StreamKind::Video => MFMediaType_Video,
+            StreamKind::Audio => MFMediaType_Audio,
+        };
+        if major != expected_major {
             return Err(windows::core::Error::from_hresult(MF_E_INVALIDMEDIATYPE));
         }
-        let sub = unsafe { mt.GetGUID(&MF_MT_SUBTYPE) };
-        let ok = sub.map(|g| self.accepted.contains(&g)).unwrap_or(false);
-        if ok {
-            Ok(())
-        } else {
-            Err(windows::core::Error::from_hresult(MF_E_INVALIDMEDIATYPE))
+        let sub = unsafe { mt.GetGUID(&MF_MT_SUBTYPE) }?;
+        if !self.accepted.contains(&sub) {
+            return Err(windows::core::Error::from_hresult(MF_E_INVALIDMEDIATYPE));
         }
+        if self.kind == StreamKind::Audio {
+            // 校验 MF_MT_AAC_PAYLOAD_TYPE == 0（Raw AAC）
+            if let Ok(payload_type) = unsafe { mt.GetUINT32(&MF_MT_AAC_PAYLOAD_TYPE) } {
+                if payload_type != 0 {
+                    return Err(windows::core::Error::from_hresult(MF_E_INVALIDMEDIATYPE));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn GetMediaTypeCount(&self) -> WinResult<u32> {
-        // ★ 必须非零。`MFCreateSinkWriterFromMediaSink` 建 writer 时就会枚举它，
-        // 返回 0 直接 `MF_E_NO_MORE_TYPES`（0xC00D36B9）。
         strace!("handler.GetMediaTypeCount -> {}", self.accepted.len());
         Ok(self.accepted.len() as u32)
     }
@@ -246,9 +298,22 @@ impl IMFMediaTypeHandler_Impl for RawTypeHandler_Impl {
             .get(index as usize)
             .ok_or_else(|| windows::core::Error::from_hresult(MF_E_NO_MORE_TYPES))?;
         let mt: IMFMediaType = unsafe { MFCreateMediaType()? };
-        unsafe {
-            mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            mt.SetGUID(&MF_MT_SUBTYPE, subtype)?;
+        match self.kind {
+            StreamKind::Video => unsafe {
+                mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+                mt.SetGUID(&MF_MT_SUBTYPE, subtype)?;
+            },
+            StreamKind::Audio => unsafe {
+                mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+                mt.SetGUID(&MF_MT_SUBTYPE, subtype)?;
+                mt.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
+                mt.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000)?;
+                mt.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+                mt.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4)?;
+                mt.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 40000)?;
+                mt.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)?;
+                mt.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29)?;
+            },
         }
         Ok(mt)
     }
@@ -258,34 +323,56 @@ impl IMFMediaTypeHandler_Impl for RawTypeHandler_Impl {
             .as_ref()
             .and_then(|m| unsafe { m.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) }.ok())
             .unwrap_or(0);
-        strace!("handler.SetCurrentMediaType (seq_header={hdr})");
+        strace!(
+            "handler.SetCurrentMediaType (stream={}, seq_header={hdr})",
+            self.identifier
+        );
         let Some(mt) = pmediatype.as_ref() else {
             return Err(windows::core::Error::from_hresult(E_POINTER));
         };
         {
             let mut s = SinkState::lock(&self.state);
+            let stream = s
+                .streams
+                .entry(self.identifier)
+                .or_insert_with(|| StreamState {
+                    identifier: self.identifier,
+                    kind: self.kind,
+                    subtype: GUID::zeroed(),
+                    sequence_header: Vec::new(),
+                    frame_size: None,
+                    samples: Vec::new(),
+                });
 
             if let Ok(sub) = unsafe { mt.GetGUID(&MF_MT_SUBTYPE) } {
-                s.subtype = Some(sub);
+                stream.subtype = sub;
             }
-            if let Ok(size) = unsafe { mt.GetUINT64(&MF_MT_FRAME_SIZE) } {
-                s.frame_size = Some(((size >> 32) as u32, (size & 0xFFFF_FFFF) as u32));
-            }
-            // 参数集：H.264 是 avcC、HEVC 是 hvcC、AV1 是 av1C 的**盒体**。
-            // 有些编码器要等第一个关键帧之后才把它填进 media type，
-            // 所以这里「有就覆盖、没有就留着旧的」。
-            if let Ok(len) = unsafe { mt.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) }
-                && len > 0
-            {
-                let mut buf = vec![0u8; len as usize];
-                let mut got = 0u32;
-                if unsafe { mt.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut buf, Some(&mut got)) }
-                    .is_ok()
+            if self.kind == StreamKind::Video {
+                if let Ok(size) = unsafe { mt.GetUINT64(&MF_MT_FRAME_SIZE) } {
+                    stream.frame_size = Some(((size >> 32) as u32, (size & 0xFFFF_FFFF) as u32));
+                }
+                if let Ok(len) = unsafe { mt.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) }
+                    && len > 0
                 {
-                    buf.truncate(got as usize);
-                    if s.sequence_header != buf {
-                        s.sequence_header = buf;
-                        s.header_revisions += 1;
+                    let mut buf = vec![0u8; len as usize];
+                    let mut got = 0u32;
+                    if unsafe { mt.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut buf, Some(&mut got)) }
+                        .is_ok()
+                    {
+                        buf.truncate(got as usize);
+                        if stream.sequence_header != buf {
+                            stream.sequence_header = buf;
+                            s.header_revisions += 1;
+                        }
+                    }
+                }
+            } else if self.kind == StreamKind::Audio {
+                if let Ok(payload) = unsafe { mt.GetUINT32(&MF_MT_AAC_PAYLOAD_TYPE) } {
+                    if payload != 0 {
+                        return Err(windows::core::Error::new(
+                            windows::Win32::Foundation::E_INVALIDARG,
+                            format!("音频流必须是 Raw AAC (payload type 0)，但收到了 {payload}"),
+                        ));
                     }
                 }
             }
@@ -304,7 +391,10 @@ impl IMFMediaTypeHandler_Impl for RawTypeHandler_Impl {
     }
 
     fn GetMajorType(&self) -> WinResult<GUID> {
-        Ok(MFMediaType_Video)
+        match self.kind {
+            StreamKind::Video => Ok(MFMediaType_Video),
+            StreamKind::Audio => Ok(MFMediaType_Audio),
+        }
     }
 }
 
@@ -389,8 +479,10 @@ impl IMFStreamSink_Impl for RawStreamSink_Impl {
         };
         {
             let mut s = SinkState::lock(&self.state);
-            s.total += 1;
-            s.samples.push(packed);
+            s.total_samples += 1;
+            if let Some(stream) = s.streams.get_mut(&self.identifier) {
+                stream.samples.push(packed);
+            }
         }
         // 拉模式：交出一帧就再要一帧。
         queue_event(self.queue.clone(), MEStreamSinkRequestSample.0 as u32);
@@ -474,7 +566,6 @@ fn pack_sample(sample: &IMFSample) -> WinResult<EncodedSample> {
 #[implement(IMFMediaSink)]
 struct RawMediaSinkImpl {
     state: Arc<Mutex<SinkState>>,
-    queue: IMFMediaEventQueue,
     /// 接受的编码子类型，用来给新建的流造类型处理器
     accepted: Vec<GUID>,
     parent: Arc<Mutex<Option<IMFMediaSink>>>,
@@ -503,18 +594,34 @@ impl IMFMediaSink_Impl for RawMediaSinkImpl_Impl {
         pmediatype: windows::core::Ref<IMFMediaType>,
     ) -> WinResult<IMFStreamSink> {
         strace!("sink.AddStreamSink(id={identifier})");
+        let major = pmediatype
+            .as_ref()
+            .and_then(|m| unsafe { m.GetGUID(&MF_MT_MAJOR_TYPE) }.ok())
+            .unwrap_or(MFMediaType_Video);
+
+        let (kind, accepted) = if major == MFMediaType_Audio {
+            (StreamKind::Audio, vec![MFAudioFormat_AAC])
+        } else {
+            (StreamKind::Video, self.accepted.clone())
+        };
+
         let handler: IMFMediaTypeHandler = RawTypeHandler {
             state: self.state.clone(),
-            accepted: self.accepted.clone(),
+            identifier,
+            kind,
+            accepted,
             current: Mutex::new(None),
         }
         .into();
         // 把 SinkWriter 给的目标编码格式记下来（参数集就藏在这里）。
         let _ = unsafe { handler.SetCurrentMediaType(pmediatype.as_ref()) };
 
+        // ★ 每条流必须是各自独立的事件队列！
+        let queue: IMFMediaEventQueue = unsafe { MFCreateEventQueue()? };
+
         let stream: IMFStreamSink = RawStreamSink {
             state: self.state.clone(),
-            queue: self.queue.clone(),
+            queue: queue.clone(),
             handler,
             parent: self.parent.clone(),
             identifier,
@@ -524,14 +631,14 @@ impl IMFMediaSink_Impl for RawMediaSinkImpl_Impl {
         // 照收不误（先缓冲），但编码器永远不被泵动、`ProcessSample` 一次都不会
         // 被调用，最后卡死在 `Finalize()`。
         unsafe {
-            self.queue.QueueEventParamVar(
+            queue.QueueEventParamVar(
                 MEStreamSinkStarted.0 as u32,
                 &GUID::zeroed(),
                 HRESULT(0),
                 std::ptr::null(),
             )?;
         }
-        queue_event(self.queue.clone(), MEStreamSinkRequestSample.0 as u32);
+        queue_event(queue.clone(), MEStreamSinkRequestSample.0 as u32);
         self.streams().push(stream.clone());
         Ok(stream)
     }

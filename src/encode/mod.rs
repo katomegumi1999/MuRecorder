@@ -7,6 +7,7 @@
 //!   SinkWriter 挑选和驱动，但编码后的码流会被它接回来交给 `mux::Mp4Muxer`——
 //!   MF 自带的分片 sink 只认 H.264，把「写盒」拿回来后 HEVC 也能分片写盘。
 
+pub mod aac;
 pub mod mf_sink;
 pub mod sink_raw;
 pub mod soft;

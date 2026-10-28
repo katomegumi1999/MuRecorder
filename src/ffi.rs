@@ -16,7 +16,7 @@ pub fn install_panic_hook_once() {
                 .location()
                 .map(|l| format!("{}:{}", l.file(), l.line()))
                 .unwrap_or_default();
-            eprintln!("[recorder_core] panic at {location}");
+            eprintln!("[murecorder_core] panic at {location}");
             let _ = &default; // 不再调用默认 hook（避免回溯噪音）
         }));
     });

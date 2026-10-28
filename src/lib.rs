@@ -6,7 +6,8 @@
 //! 3. 每个导出函数 `catch_unwind` 包裹，panic 转为 `REC_ERR_PANIC`，
 //!    绝不让 panic 展开到 C# 宿主（release profile 因此必须保持 unwind）。
 //! 4. 字符串参数只读、不持有，调用返回后 C# 可立即释放。
-//! 5. `RecorderConfig` 首字段固定 `abi_version`，新增字段只能尾部追加。
+//! 5. `RecorderConfig` 首字段固定 `abi_version`，新增字段只能尾部追加，
+//!    **且必须同时递增 `ABI_VERSION`**（尾部追加对「已编译的旧宿主」并不兼容）。
 //! 6. 调用约定 `extern "C"`，Windows x64 即 Microsoft x64 ABI。
 //! 7. 句柄内部是 `Mutex<Recorder>`：宿主可以从任意线程并发调用（典型场景是 UI 线程
 //!    每 200ms 轮询 stats、同时另一个线程点停止），所有导出函数在锁上串行化。
@@ -18,6 +19,7 @@
 #![allow(linker_messages)]
 
 pub mod capture;
+pub mod com;
 pub mod config;
 pub mod convert;
 pub mod encode;
