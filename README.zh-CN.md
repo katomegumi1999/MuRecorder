@@ -47,7 +47,7 @@ DXGI Desktop Duplication 采集 → Media Foundation 硬件编码（H.264 / HEVC
 | 单文件录制超过 4 GiB（分片路径为 64 位 `mdat` + `co64`；AV1 普通 MP4 只能升级 `co64`，`mdat` 头超限会如实上报） | ✅ |
 | 无锁帧计数 + 200 ms 采样快照 | ✅ |
 | 音频录制（WASAPI loopback 默认设备 / 指定设备，进程树环回，AAC-LC 320k 双声道） | ✅ |
-| 鼠标指针合成 | ❌ 未实现 |
+| 鼠标指针合成（单色 / 32bpp / masked-color 三种形状，位置精确，不留残影） | ✅ |
 | HDR / 广色域采集 | ❌ 仅 SDR |
 
 ## 环境要求
@@ -66,6 +66,7 @@ cargo build --release
 把 `murecorder_core.dll` 放到可执行文件旁。
 - C 头文件：[`include/recorder.h`](include/recorder.h)
 - 详细 C# 调用文档与完整示例：[`docs/csharp-guide.md`](docs/csharp-guide.md)
+- 指针合成的设计取舍与踩坑记录：[`docs/cursor-design.md`](docs/cursor-design.md)
 
 ```csharp
 [StructLayout(LayoutKind.Sequential)]
@@ -230,9 +231,11 @@ cargo test --lib -- --ignored --nocapture   # 真实 SinkWriter：每个编码�
 
 `tests/e2e_record.rs` 真录 2 秒屏幕，再用 Media Foundation 自带 MP4 解析器读回，校验帧数、尺寸与时间轴长度。它标了 `#[ignore]`（需要桌面），但它是唯一能证明"产物被**真实**解复用器接受"的用例。另有几个 GPU 用例：`e2e_gpu_recording_finalizes_to_plain_mp4` 断言容器收敛成 `ftyp`/`mdat`/`moov` 且 Media Foundation 接受重建后的索引；`e2e_slice_gpu_recording_while_running` 在**文件仍在写入时**切一段出来，再同时校验切片和原录制（AV1 是唯一例外：它确实拒绝，并且断言拒绝的理由说得明确，不会静默跳过）；`e2e_hevc_records_when_explicitly_requested` 证明 HEVC 走的是自研 sink——**录制中**文件里就有 `moof`、`moov` 带 `mvex`，停止后 `moov` 不再带 `mvex` 且 `hvc1` 真的出现，而不是被悄悄换成 H.264。`e2e_slice_from_recording_is_playable` 覆盖软编路径的同样能力。
 
+`tests/e2e_cursor.rs` 会真的移动鼠标，断言「旧位置」和「新位置」两处像素块在两帧之间都发生了变化——这是唯一能证明指针真的走到了编码像素上的办法。它的断言刻意用**采集到的**指针位置而不是我们设的位置：机器是活的，鼠标随时可能被人接管，两者本来就可能差几个像素。另外 `encode::mf_sink::tests::gpu_cursor_is_composited_and_leaves_no_trail` 用合成光标驱动 GPU 写入器，再把喂给编码器的那份纹理读回来验像素，锁住三件事：位置对、光标移走后旧址恢复成桌面（不留残影）、指针不可见时一个像素都不画。
+
 ## 已知限制
 
-- 鼠标指针**不会**出现在录像里。`capture_cursor` 被接受但被忽略。
+- 鼠标指针是**烧进画面像素**的，不是独立叠加层：录完无法再关掉。GPU 路径只回读光标包围盒（通常 32×32）而不回读整帧，所以桌面部分仍是零拷贝。两个如实的缺口：只用来补首帧的一次性 GDI 兜底里没有指针（形状只能在持有 DXGI 帧时取到）；纯硬件覆盖层内容（部分全屏独占游戏）本来就不在桌面复制的视野内，与这个开关无关。
 - **音频只有 AAC-LC**，48 kHz / 双声道，码率限定在 `audio_bitrate_kbps` 的六档（96/128/160/192/256/320 kbps）里。采样率不开放：48 kHz 是 WASAPI 混音引擎的原生速率，换别的只会平白多一次重采样。
 - 音轨会被**真的解码一遍**再判定（`cargo test --test e2e_audio -- --ignored`）：`esds`/ASC 与码流不符会在这里失败，而不是等播放器表现为「有轨无声」。
 - HDR 桌面按 SDR BGRA8 采集，画面会被压平。
@@ -245,10 +248,9 @@ cargo test --lib -- --ignored --nocapture   # 真实 SinkWriter：每个编码�
 
 ## 路线图
 
-1. 从 `DXGI_OUTDUPL_FRAME_INFO.PointerPosition` 合成鼠标指针。
-2. 转换路径引入缓冲池与 SIMD（4K 目前要吃掉半个核心）。
-3. 暂停/恢复、录制中热改区域。
-4. AV1 的自研分片封装（`av1C` + OBU 样本），把崩溃安全与录制中切片补齐到最后一种编码器。
+1. 转换路径引入缓冲池与 SIMD（4K 目前要吃掉半个核心）。
+2. 暂停/恢复、录制中热改区域。
+3. AV1 的自研分片封装（`av1C` + OBU 样本），把崩溃安全与录制中切片补齐到最后一种编码器。
 
 ## 许可
 

@@ -6,6 +6,24 @@
 //! 3. 通过 `IMFDXGIDeviceManager` 将显卡上下文绑定到 `IMFSinkWriter`，并启用 `MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS`。
 //! 4. 逐帧截取后在 GPU 内完成裁剪 (`CopySubresourceRegion`)，
 //!    调用 `MFCreateDXGISurfaceBuffer` 直接包装显存纹理句柄，通过 `IMFSinkWriter::WriteSample` 直送硬件编码器。
+//!
+//! ## 指针合成为什么是这样做的
+//!
+//! 桌面复制的桌面图像里没有鼠标指针，必须自己画（详见 [`crate::capture::cursor`]）。
+//! 合成点在**裁剪后的 BGRA 纹理**上、`BGRA→NV12` 之前，这样 H.264（ARGB32 输入）
+//! 与 HEVC/AV1（NV12 输入）两条路走的是同一份像素。
+//!
+//! 三个关键决定：
+//!
+//! 1. **两份纹理。** `desktop_texture` 存「纯桌面」，`cropped_texture` 存
+//!    「桌面 + 指针」。没有前者的话，指针移动时新指针会画在旧指针上，
+//!    鼠标划过的轨迹会留下一串残影。
+//! 2. **只回读光标的包围盒，不整帧回读。** 整帧回读会让 4K 每帧多走 33 MB
+//!    PCIe（等于把零拷贝的收益全吐回去）。包围盒通常只有 32×32～64×64。
+//! 3. **像素逻辑复用 CPU 那一份**（[`crate::capture::CursorShape::blend_into`]），
+//!    不在 GPU 侧另写一套。单色光标的「反色」分支必须读到桌面像素才能算，用着色器
+//!    实现得再做一次全屏采样；而包围盒回读天然把桌面像素摆在手边。代价是每帧一次小
+//!    Map（约 0.1–0.3 ms），换来的是 CPU/GPU 两条路不可能出现像素分歧。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,8 +31,9 @@ use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_FLAG,
-    D3D11_RESOURCE_MISC_FLAG, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
+    D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_MAP_READ_WRITE, D3D11_RESOURCE_MISC_FLAG,
+    D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_STREAM,
     D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
@@ -50,6 +69,9 @@ use windows::Win32::System::Com::{
 };
 use windows::core::{Error as WinError, Interface, PCWSTR, Result as WinResult};
 
+use crate::capture::PointerFrame;
+use crate::capture::cursor::overlay_rect;
+use crate::capture::dxgi::FrameMeta;
 use crate::encode::sink_raw::RawMediaSink;
 use crate::mux::mp4::{Mp4Muxer, SampleDescription};
 use crate::mux::nal::{annexb_to_mp4_sample, build_avcc, build_hvcc, parse_parameter_sets};
@@ -291,6 +313,16 @@ pub struct GpuSinkWriter {
     stream_index: u32,
     audio_stream_index: Option<u32>,
     cropped_texture: ID3D11Texture2D,
+    /// 只含桌面、不含指针的一份副本。
+    ///
+    /// 指针每帧都要重画，必须有一份「干净的底」可以重来；否则新指针叠在旧指针上，
+    /// 快速移动鼠标会拖出一串残影。仅在开启指针合成时按需创建。
+    desktop_texture: Option<ID3D11Texture2D>,
+    /// `desktop_texture` 是否已被本会话的有效帧填过。
+    /// 未填过时第一帧必须强制拷贝（`FrameMeta.desktop_updated` 可能为 false）。
+    desktop_valid: bool,
+    /// 指针包围盒的 CPU 回读暂存纹理（尺寸随光标变化重建）。
+    cursor_staging: Option<(ID3D11Texture2D, u32, u32)>,
     converter: Option<D3D11VideoConverter>,
     width: u32,
     height: u32,
@@ -712,6 +744,9 @@ impl GpuSinkWriter {
                 stream_index,
                 audio_stream_index,
                 cropped_texture,
+                desktop_texture: None,
+                desktop_valid: false,
+                cursor_staging: None,
                 converter,
                 width: aligned_width,
                 height: aligned_height,
@@ -804,42 +839,182 @@ impl GpuSinkWriter {
         self.drain_raw()
     }
 
-    /// 核心调用：在显存内完成子区域裁剪并直接包装送入 GPU 编码器。
+    /// 核心调用：在显存内完成子区域裁剪、（可选）指针合成，并直接包装送入 GPU 编码器。
     ///
     /// `pts_us` 必须是**真实采集时刻**（相对录制起点的 QPC 微秒）。
     /// 早期实现用 `frame_count × 帧间隔` 生成时间戳，一旦编码或写盘跟不上，
     /// 时间轴就按帧数压缩——60 秒的实录可能只播 20 秒，接入音频后必然音画不同步。
+    ///
+    /// `meta.pointer` 为 `Some` 表示本次录制开启了指针合成（形状是否就绪另说）；
+    /// `meta.desktop_updated` 表示显存里的桌面图像本帧是否真的变了。后者为 false
+    /// 时只需把上次存下的纯桌面副本再摊一次，不必再截一次显存——「只有鼠标在动、
+    /// 画面别处完全静止」是很常见的情形。
     pub fn push_frame(
         &mut self,
         source_texture: &ID3D11Texture2D,
         crop_x: u32,
         crop_y: u32,
         pts_us: u64,
+        meta: FrameMeta<'_>,
     ) -> WinResult<()> {
-        unsafe {
-            // 步骤 A: GPU 显存内 DMA 区域拷贝（零 CPU 消耗）
-            let crop_box = D3D11_BOX {
-                left: crop_x,
-                top: crop_y,
-                front: 0,
-                right: crop_x + self.width,
-                bottom: crop_y + self.height,
-                back: 1,
-            };
+        let crop_box = D3D11_BOX {
+            left: crop_x,
+            top: crop_y,
+            front: 0,
+            right: crop_x + self.width,
+            bottom: crop_y + self.height,
+            back: 1,
+        };
 
+        match meta.pointer {
+            // 未开启指针合成：一条路走到底，不引入任何额外拷贝。
+            None => unsafe {
+                self.context.CopySubresourceRegion(
+                    &self.cropped_texture,
+                    0,
+                    0,
+                    0,
+                    0,
+                    source_texture,
+                    0,
+                    Some(&crop_box),
+                );
+            },
+            // 开启指针合成：先维护「纯桌面」副本，再从它派生本帧画面。
+            Some(pointer) => {
+                self.ensure_desktop_texture()?;
+                if meta.desktop_updated || !self.desktop_valid {
+                    let desktop = self.desktop_texture.as_ref().unwrap();
+                    unsafe {
+                        self.context.CopySubresourceRegion(
+                            desktop,
+                            0,
+                            0,
+                            0,
+                            0,
+                            source_texture,
+                            0,
+                            Some(&crop_box),
+                        );
+                    }
+                    self.desktop_valid = true;
+                }
+                let desktop = self.desktop_texture.as_ref().unwrap();
+                // 每帧都从干净底重来：这是「不留残影」的全部要点。
+                unsafe { self.context.CopyResource(&self.cropped_texture, desktop) };
+
+                // 形状与可见性都就绪才真正落笔。
+                if pointer.is_drawable() {
+                    self.composite_cursor(&pointer)?;
+                }
+            }
+        }
+
+        unsafe { self.write_current_buffer(pts_us) }
+    }
+
+    /// 把指针画到 `cropped_texture` 上：只回读光标包围盒，合成后写回。
+    fn composite_cursor(&mut self, pointer: &PointerFrame<'_>) -> WinResult<()> {
+        let Some(shape) = pointer.shape else {
+            return Ok(());
+        };
+        // 包围盒与 CPU 路径共用同一份裁剪逻辑，避免两条路对「部分可见」判断不一致。
+        let Some((left, top, bw, bh)) = overlay_rect(pointer.state, shape, self.width, self.height)
+        else {
+            // 完全在画面外（常见：鼠标在另一块屏上）。
+            return Ok(());
+        };
+        // `PointerPosition` 给的是光标图像**左上角**（不是热点）。
+        let (sx, sy) = (pointer.state.x, pointer.state.y);
+
+        let staging = self.ensure_cursor_staging(bw, bh)?.clone();
+
+        // 1. 把目标包围盒读回 CPU 暂存纹理
+        let read_back = D3D11_BOX {
+            left,
+            top,
+            front: 0,
+            right: left + bw,
+            bottom: top + bh,
+            back: 1,
+        };
+        unsafe {
+            self.context.CopySubresourceRegion(
+                &staging,
+                0,
+                0,
+                0,
+                0,
+                &self.cropped_texture,
+                0,
+                Some(&read_back),
+            );
+        }
+
+        // 2. CPU 合成（与软编路径同一份像素逻辑）
+        let mut mapped = Default::default();
+        unsafe {
+            self.context
+                .Map(&staging, 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped))?;
+        }
+        {
+            // 行距按 RowPitch 算，不要假设等于 bw*4（驱动常按 256 字节对齐）。
+            let stride = mapped.RowPitch as usize;
+            let len = stride * bh as usize;
+            // Safety: staging 纹理是本函数刚建的、至少 bw×bh，Map 保证可读写整块。
+            let buf = unsafe { std::slice::from_raw_parts_mut(mapped.pData as *mut u8, len) };
+            // 缓冲区原点对应画面 (left, top)，光标原点在 (sx, sy)，两者相减即可
+            // 让 blend_into 自己处理越界裁剪。
+            shape.blend_into(buf, stride, bw, bh, sx - left as i32, sy - top as i32);
+        }
+        unsafe {
+            self.context.Unmap(&staging, 0);
+        }
+
+        // 3. 写回同一位置
+        let write_back = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: bw,
+            bottom: bh,
+            back: 1,
+        };
+        unsafe {
             self.context.CopySubresourceRegion(
                 &self.cropped_texture,
                 0,
+                left,
+                top,
                 0,
+                &staging,
                 0,
-                0,
-                source_texture,
-                0,
-                Some(&crop_box),
+                Some(&write_back),
             );
-
-            self.write_current_buffer(pts_us)
         }
+        Ok(())
+    }
+
+    /// 按需创建「纯桌面」副本纹理。
+    fn ensure_desktop_texture(&mut self) -> WinResult<()> {
+        if self.desktop_texture.is_none() {
+            let tex = create_render_texture(&self._device, self.width, self.height)?;
+            self.desktop_texture = Some(tex);
+            self.desktop_valid = false;
+        }
+        Ok(())
+    }
+
+    /// 按需创建/扩容指针包围盒的暂存纹理（STAGING，CPU 可读写）。
+    ///
+    /// 只在光标尺寸变大时重建；换光标很稀疏，这点分配可以忽略。
+    fn ensure_cursor_staging(&mut self, w: u32, h: u32) -> WinResult<&ID3D11Texture2D> {
+        let fits = matches!(&self.cursor_staging, Some((_, ew, eh)) if *ew >= w && *eh >= h);
+        if !fits {
+            let tex = create_cursor_staging_texture(&self._device, w.max(1), h.max(1))?;
+            self.cursor_staging = Some((tex, w.max(1), h.max(1)));
+        }
+        Ok(&self.cursor_staging.as_ref().unwrap().0)
     }
 
     /// 画面无变化时，复用已在显存中的上一帧内容直接编码，维持恒定帧率 (CFR)。
@@ -1011,6 +1186,36 @@ impl Drop for GpuSinkWriter {
     }
 }
 
+/// 辅助函数：创建承载指针包围盒回读的暂存纹理（CPU 可读可写）。
+///
+/// 只覆盖光标大小，不是整帧——这是「合成指针又不毁掉零拷贝」的关键：
+/// 整帧回读在 4K 下每帧要走 33 MB 的 PCIe，而光标边长通常只有 32～64 像素。
+fn create_cursor_staging_texture(
+    device: &ID3D11Device,
+    w: u32,
+    h: u32,
+) -> WinResult<ID3D11Texture2D> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: w,
+        Height: h,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_STAGING,
+        // STAGING 纹理的 BindFlags 必须为 0（D3D11 规范），误绑会 E_INVALIDARG。
+        BindFlags: 0,
+        CPUAccessFlags: (D3D11_CPU_ACCESS_READ.0 | D3D11_CPU_ACCESS_WRITE.0) as u32,
+        MiscFlags: 0,
+    };
+    let mut texture: Option<ID3D11Texture2D> = None;
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+    texture.ok_or_else(|| WinError::from_hresult(E_FAIL))
+}
+
 /// 辅助函数：创建用于承载裁剪区域的显存纹理
 fn create_render_texture(
     device: &ID3D11Device,
@@ -1152,7 +1357,223 @@ mod tests {
         }
     }
 
+    /// GPU 路径的指针合成：真的把光标像素写进了喂给编码器的那份纹理，且不留残影。
+    ///
+    /// 这是唯一能验证「两份纹理 + 包围盒回读」这套做法的用例。它检查三件事：
+    /// 1. 光标位置上的像素被换成了光标色；
+    /// 2. 远离光标的位置仍是桌面原色（说明包围盒没有写歪）；
+    /// 3. **光标移走之后，原来位置恢复成桌面色**——没有第 3 条的话，鼠标快速划过
+    ///    会留下一串光标残影，而单帧截图完全看不出来。
+    ///
+    /// CPU 路径的合成由 `capture::cursor` 的单测覆盖，这里专测 GPU 这层搬运。
+    #[test]
+    #[ignore = "需要真实 GPU 硬件编码器（本地手动验证）"]
+    fn gpu_cursor_is_composited_and_leaves_no_trail() {
+        use windows::Win32::Graphics::Direct3D::*;
+        use windows::Win32::Graphics::Direct3D11::*;
+
+        const W: u32 = 320;
+        const H: u32 = 240;
+        /// 桌面底色（BGRA）
+        const DESKTOP: [u8; 4] = [0x40, 0x80, 0xC0, 0xFF];
+        /// 光标色（BGRA）：纯红
+        const CURSOR: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
+
+        let _guard = MfRuntimeGuard::new().unwrap();
+        let mut device_opt: Option<ID3D11Device> = None;
+        let mut context_opt: Option<ID3D11DeviceContext> = None;
+        let creation_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+        let hr = unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                windows::Win32::Foundation::HMODULE::default(),
+                creation_flags,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device_opt),
+                None,
+                Some(&mut context_opt),
+            )
+        };
+        if hr.is_err() {
+            println!("没有可用的 D3D11 硬件设备，跳过");
+            return;
+        }
+        let device = device_opt.unwrap();
+        let context = context_opt.unwrap();
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_gpu_cursor.mp4");
+        let _ = std::fs::remove_file(&path);
+        let mut sink = GpuSinkWriter::try_new(
+            &device,
+            &context,
+            &path.to_string_lossy(),
+            W,
+            H,
+            30,
+            2000,
+            GpuCodec::H264,
+            ContainerMode::Plain,
+            None,
+        )
+        .expect("H264 普通 MP4 应能打开");
+
+        // 假桌面：一整片纯色，方便判断某个像素到底是谁画上去的。
+        let source = create_render_texture(&device, W, H).unwrap();
+        let desktop = vec![DESKTOP[0]; (W * H) as usize];
+        let mut desktop_bgra = Vec::with_capacity((W * H * 4) as usize);
+        for _ in 0..(W * H) {
+            desktop_bgra.extend_from_slice(&DESKTOP);
+        }
+        let _ = desktop;
+        unsafe {
+            context.UpdateSubresource(
+                &source,
+                0,
+                None,
+                desktop_bgra.as_ptr() as *const std::ffi::c_void,
+                W * 4,
+                0,
+            );
+        }
+
+        // 8×8 不透明纯红光标
+        let cursor_data: Vec<u8> = std::iter::repeat_n(CURSOR, 64).flatten().collect();
+        let cursor_info = windows::Win32::Graphics::Dxgi::DXGI_OUTDUPL_POINTER_SHAPE_INFO {
+            Type: windows::Win32::Graphics::Dxgi::DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32,
+            Width: 8,
+            Height: 8,
+            Pitch: 32,
+            HotSpot: windows::Win32::Foundation::POINT { x: 0, y: 0 },
+        };
+        let shape =
+            crate::capture::CursorShape::parse(cursor_info.Type, &cursor_info, &cursor_data)
+                .expect("8×8 的 32bpp 光标应能解析");
+
+        let pointer_at = |x: i32, y: i32| crate::capture::PointerFrame {
+            state: crate::capture::PointerState {
+                visible: true,
+                x,
+                y,
+            },
+            shape: Some(&shape),
+        };
+
+        // 回读辅助：把 cropped_texture 拷到 staging 再取某个像素。
+        // `sink` 显式作为参数传进来，避免闭包长期借用它而挡住后面的 `push_frame`。
+        let read_pixel = |sink: &GpuSinkWriter, x: u32, y: u32| -> [u8; 4] {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: W,
+                Height: H,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut staging: Option<ID3D11Texture2D> = None;
+            unsafe {
+                device
+                    .CreateTexture2D(&desc, None, Some(&mut staging))
+                    .unwrap()
+            };
+            let staging = staging.unwrap();
+            unsafe {
+                context.CopyResource(&staging, &sink.cropped_texture);
+                let mut mapped = Default::default();
+                context
+                    .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .unwrap();
+                let base = mapped.pData as *const u8;
+                let off = y as usize * mapped.RowPitch as usize + x as usize * 4;
+                let px = std::slice::from_raw_parts(base.add(off), 4);
+                let out = [px[0], px[1], px[2], px[3]];
+                context.Unmap(&staging, 0);
+                out
+            }
+        };
+
+        // 第 1 帧：光标画在 (50, 60)
+        sink.push_frame(
+            &source,
+            0,
+            0,
+            0,
+            FrameMeta {
+                desktop_updated: true,
+                pointer: Some(pointer_at(50, 60)),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(read_pixel(&sink, 54, 64), CURSOR, "光标中心应被换成光标色");
+        assert_eq!(
+            read_pixel(&sink, 10, 10),
+            DESKTOP,
+            "远离光标处应保持桌面原色"
+        );
+
+        // 第 2 帧：光标移到 (200, 100)。此时桌面没有更新（只有指针动）。
+        sink.push_frame(
+            &source,
+            0,
+            0,
+            33_333,
+            FrameMeta {
+                desktop_updated: false,
+                pointer: Some(pointer_at(200, 100)),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(read_pixel(&sink, 204, 104), CURSOR, "光标新位置应被画上");
+        assert_eq!(
+            read_pixel(&sink, 54, 64),
+            DESKTOP,
+            "光标旧址必须恢复成桌面色——否则快速移动会拖出一串残影"
+        );
+
+        // 第 3 帧：指针不可见，整个画面都该是桌面色。
+        let invisible = crate::capture::PointerFrame {
+            state: crate::capture::PointerState {
+                visible: false,
+                x: 200,
+                y: 100,
+            },
+            shape: Some(&shape),
+        };
+        sink.push_frame(
+            &source,
+            0,
+            0,
+            66_666,
+            FrameMeta {
+                desktop_updated: false,
+                pointer: Some(invisible),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_pixel(&sink, 204, 104),
+            DESKTOP,
+            "指针不可见时不应留下任何光标像素"
+        );
+
+        sink.finish().unwrap();
+        let _ = std::fs::remove_file(&path);
+        println!("GPU 指针合成通过：位置正确、无残影、不可见时不绘制");
+    }
+
     /// 需要真实硬件编码器与 MF 运行时；无头 CI / 无 GPU 环境请用 `--ignored` 显式启用。
+
     #[test]
     #[ignore = "需要真实 GPU 硬件编码器（本地手动验证）"]
     fn test_gpu_sink_writer_pipeline() {

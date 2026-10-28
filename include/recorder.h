@@ -60,7 +60,7 @@ typedef struct {
     uint32_t fps;
     uint32_t encoder;            /* 0=auto, 1=gpu_hevc, 2=gpu_h264, 3=amf, 4=x264(soft), 5=gpu_av1 */
     uint32_t bitrate_kbps;
-    uint32_t capture_cursor;     /* 0/1，M1 忽略 */
+    uint32_t capture_cursor;     /* 0/1：是否把鼠标指针烧进画面（默认 0）。开启后 GPU 路径只回读光标包围盒，不破坏零拷贝 */
     const char* output_path;     /* UTF-8，NUL 结尾；Rust 只读不持有 */
     uint32_t audio_source_type;  /* AudioSourceType */
     const char* audio_device_id; /* UTF-8，可空；AUDIO_DEVICE 时必填 */

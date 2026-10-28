@@ -14,7 +14,7 @@
 
 use murecorder_core::config::{AudioSourceType, EncoderPreference, RecordingConfig};
 use murecorder_core::recorder::Recorder;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::Win32::Media::MediaFoundation::{
     IMFMediaType, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
     MF_SOURCE_READERF_ENDOFSTREAM, MF_VERSION, MFCreateSourceReaderFromURL, MFMediaType_Video,
@@ -180,6 +180,76 @@ fn e2e_software_encoder() {
 #[ignore = "需要真实桌面会话与硬件编码器；用 --ignored 手动运行"]
 fn e2e_gpu_encoder() {
     record_and_verify("gpu", EncoderPreference::Auto);
+}
+
+/// 开启 `capture_cursor` 录一段，期间**持续移动鼠标**，产物必须仍然可解码且时长正常。
+///
+/// 这条用例覆盖的是接线本身：`capture_cursor` 从 C# 配置一路传到
+/// `DxgiCapture::new(…, CaptureOptions)`、`acquire_texture` 的 `FrameMeta`、
+/// 再到 `GpuSinkWriter::push_frame`。其中任何一环没接上，要么崩在闭包里，
+/// 要么时间戳错乱，要么干脆没帧——都不是「指针没画出来」这么温和的失败。
+///
+/// 顺带压测「只有指针更新」的帧：桌面不动、鼠标动，`AccumulatedFrames` 为 0，
+/// 走的是「复用纯桌面副本 + 重画光标」那条分支，而不是重新截屏。
+#[test]
+#[ignore = "需要真实桌面会话与硬件编码器，且会移动真实鼠标指针（结束会还原）"]
+fn e2e_gpu_recording_with_cursor() {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+
+    let mut origin = POINT::default();
+    // Safety: 本地变量地址，调用期间有效。
+    let saved = unsafe { GetCursorPos(&mut origin) }.is_ok();
+
+    let dir = std::env::temp_dir().join("murecorder_e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("e2e_gpu_cursor.mp4");
+    let _ = std::fs::remove_file(&path);
+    let path_str = path.to_string_lossy().to_string();
+
+    let mut cfg = recording_config(&path_str, EncoderPreference::Auto);
+    cfg.capture_cursor = true;
+
+    let mut rec = Recorder::created(cfg).expect("create 失败");
+    rec.start().expect("start 失败");
+
+    // 在区域内部按网格走一圈：既有位移也有方向变化，能覆盖
+    // 「位置变了」与「位置没变但形状换了」两类更新。
+    let steps = (DURATION_MS / 30) as i32;
+    for i in 0..steps {
+        let x = REGION.0 + 4 + (i % 12) * 24;
+        let y = REGION.1 + 4 + ((i / 12) % 8) * 26;
+        unsafe {
+            let _ = SetCursorPos(x, y);
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    rec.stop().expect("stop 失败（封装可能失败）");
+
+    if saved {
+        unsafe {
+            let _ = SetCursorPos(origin.x, origin.y);
+        }
+    }
+
+    let file_size = std::fs::metadata(&path).expect("产物文件不存在").len();
+    let (frames, seconds) = inspect_with_mf(&path_str);
+    let snap = rec.stats_snapshot();
+    println!(
+        "[gpu+cursor] {file_size} B, {frames} 帧, 时长 {seconds:.2}s, \
+         captured={} encoded={} dropped={}",
+        snap.frames_captured, snap.frames_encoded, snap.frames_dropped
+    );
+
+    assert!(frames > 30, "[gpu+cursor] 帧数过少: {frames}");
+    let expected = DURATION_MS as f64 / 1000.0;
+    assert!(
+        (expected - 0.4..=expected + 0.6).contains(&seconds),
+        "[gpu+cursor] 时长应约 {expected:.1}s，实际 {seconds:.2}s"
+    );
+
+    let _ = std::fs::remove_file(&path);
 }
 
 /// 录制中切片 → 产物必须被 MF 独立读回，且帧数/时长与切出的区间一致。
@@ -396,16 +466,27 @@ fn e2e_hevc_records_when_explicitly_requested() {
     let mut rec =
         Recorder::created(recording_config(&path_str, EncoderPreference::GpuHevc)).unwrap();
     rec.start().unwrap();
-    std::thread::sleep(Duration::from_millis(1_200));
 
-    // 录制中就必须是分片态：有 `moof`、没有 `moov`（索引要到停止时才补）。
+    // 录制中就必须是分片态：有 `moof`、`moov` 只是初始化段（索引到停止时才补）。
     // 这一条直接证明「HEVC 也能 Hybrid」，而不只是「能录出 HEVC」。
-    let live = top_level_boxes(&path_str);
+    //
+    // 为什么要**轮询**而不是固定等 1.2 s：分片是在「下一个关键帧到来」时闭合的
+    // （见 `mp4.rs::write_video_sample`），而 HEVC 硬编的关键帧间隔约 30 帧 ≈ 1 s，
+    // 再叠加启动延迟，1.2 s 那个时刻恰好压在边界上——同一台机器上「已出 moof」和
+    // 「还没出 moof」都出现过（实测 35 帧→有，30 帧→没有）。定点检查会假失败，
+    // 轮询到出现为止既稳定、又比原来更严格（原来只是「1.2 s 时恰好有」）。
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut live = top_level_boxes(&path_str);
+    while !live.iter().any(|k| k == "moof") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(80));
+        live = top_level_boxes(&path_str);
+    }
     // 录制中的 moov 是**初始化段**（只有解码参数，没有样本表），标志是 `mvex`。
-    // 必须此刻检查：停止后 init moov 会被那个巨型 mdat 吞掉，只剩末尾的完整 moov。
+    // 必须在停止前检查：停止后 init moov 会被那个巨型 mdat 吞掉，只剩末尾的完整 moov。
     let live_init_mvex = moov_contains(&path_str, b"mvex");
     println!("[hevc] 录制中顶层盒: {live:?}, init moov 带 mvex={live_init_mvex}");
 
+    // 再录一会儿，保证停止时不止一个分片。
     std::thread::sleep(Duration::from_millis(1_300));
     rec.stop().unwrap();
 

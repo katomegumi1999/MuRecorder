@@ -1,11 +1,22 @@
 //! DXGI Desktop Duplication 捕获会话。
 //!
-//! M1 范围（对应设计文档 4.2 的软件路径）：
-//! - 按区域左上角所在显示器 `DuplicateOutput`，逐帧拷贝到 staging 纹理后 Map 到 CPU；
-//! - 硬件编码路径（M3）将改为纹理直送编码器，本模块的 `Frame` 结构已为纹理引用预留位置。
+//! - 按区域左上角所在显示器 `DuplicateOutput`；
+//! - 软件编码路径：逐帧拷贝到 staging 纹理后 Map 到 CPU（[`DxgiCapture::acquire_frame`]）；
+//! - 硬件编码路径：纹理在闭包里直送编码器，全程不出显存
+//!   （[`DxgiCapture::acquire_texture`]）。
 //!
 //! 设备丢失（设计文档 4.3）：调用方检测到 `AccessLost` / `DeviceRemoved` 后进入重建循环
 //! （sleep 500ms 重试 `duplicate_output`，最多 10 次），本模块提供 [`DxgiCapture::rebuild`]。
+//!
+//! ## 指针通道
+//!
+//! 桌面复制交付的桌面图像里**不含鼠标指针**，指针走独立旁路
+//! （`PointerPosition` + `GetFramePointerShape`）。本模块负责维护这份状态并
+//! 在 CPU 路径直接合成；GPU 路径则把 [`PointerFrame`] 交给调用方，由它在显存内合成
+//! （见 [`crate::encode::mf_sink`]）。
+//!
+//! 这里最容易搞错的两件事，都在 [`super::cursor`] 的模块注释里展开：
+//! **位置是左上角而非热点**，以及**不是每帧都带指针更新**（必须持久化上一状态）。
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -21,14 +32,48 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
+    CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_MORE_DATA,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
 };
 use windows::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, INFINITE, SetWaitableTimer,
     TIMER_ALL_ACCESS, WaitForSingleObject,
 };
 use windows::core::{Error as WinError, Interface, Result as WinResult};
+
+use crate::capture::cursor::{CursorShape, PointerFrame, PointerState};
+
+/// 采集选项。
+///
+/// 单独做一个结构体而不是往 `CaptureTarget` 里塞字段：`CaptureTarget` 描述的是
+/// 「录哪块屏幕」，属于几何信息；这里描述的是「怎么录」，两者生命周期与来源都不同
+/// （前者由区域推算，后者来自用户配置）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CaptureOptions {
+    /// 是否把鼠标指针合成进画面（对应 ABI 的 `capture_cursor`）。
+    ///
+    /// 默认 `false`：合成指针要额外维护一份「纯桌面」副本并每帧回读光标包围盒，
+    /// 不该在用户没要求时默默付出这份开销。
+    pub capture_cursor: bool,
+}
+
+impl CaptureOptions {
+    pub fn with_cursor(capture_cursor: bool) -> Self {
+        Self { capture_cursor }
+    }
+}
+
+/// 显存采集时交给闭包的帧元信息。
+///
+/// `desktop_updated == false` 表示本次 `AcquireNextFrame` 只带来了指针变化
+/// （`AccumulatedFrames == 0`）：显存里的桌面图像没变，下游若自带上一帧副本就不必重拷。
+#[derive(Clone, Copy)]
+pub struct FrameMeta<'a> {
+    pub desktop_updated: bool,
+    /// `None` 表示没有开启指针合成
+    pub pointer: Option<PointerFrame<'a>>,
+}
 
 /// 一帧捕获结果：CPU 侧 BGRA 数据（已裁剪到 region）。
 ///
@@ -74,6 +119,27 @@ pub struct DxgiCapture {
     /// 若把它当首帧收下，静止画面场景会一路重发这张黑帧，整段录制全黑——正对着
     /// 「录副屏静态文档」这个最需要兜底的用例。因此建立会话/重建后丢弃第一帧。
     discard_next_frame: bool,
+    /// 是否合成鼠标指针。
+    capture_cursor: bool,
+    /// 指针的当前位置/可见性（区域坐标系）。
+    ///
+    /// **必须持久化**：`DXGI_OUTDUPL_FRAME_INFO.PointerPosition` 只在
+    /// `LastMouseUpdateTime != 0` 的帧里有效，其余帧该字段是全 0。每帧无脑采信的话，
+    /// 鼠标一停下指针就会跳到区域左上角然后消失。
+    pointer: PointerState,
+    /// 最近一次拿到的形状。形状变化很稀疏（换光标时才变），每帧复用。
+    shape: Option<CursorShape>,
+    /// 桌面像素缓存（仅 CPU 路径使用）。
+    ///
+    /// 用途有二：① 指针移动而桌面不变时，不必重新从显存搬整帧，直接在这份缓存上
+    /// 重新合成；② 从没变过的画面直接返回这份 `Arc`，连一次 memcpy 都不做。
+    desktop_bgra: Option<Arc<[u8]>>,
+    /// 下一次交付必须重新拷贝桌面：首帧与 `rebuild` 之后置位。
+    ///
+    /// 判据不能只看 `AccumulatedFrames > 0`：`DuplicateOutput`/重建后的第一帧被我们
+    /// 丢弃了，若紧接着来一帧「只有指针动」的更新，`AccumulatedFrames` 会是 0，
+    /// 而缓存的桌面还是上一次会话的旧图（甚至从来没拷过）。
+    force_desktop_copy: bool,
 }
 
 unsafe impl Send for DxgiCapture {}
@@ -180,7 +246,7 @@ pub fn find_target(
 
 impl DxgiCapture {
     /// 在目标输出上创建 D3D11 设备并启动桌面复制。
-    pub fn new(target: &CaptureTarget) -> WinResult<Self> {
+    pub fn new(target: &CaptureTarget, options: CaptureOptions) -> WinResult<Self> {
         // 设备必须建在「持有该输出的适配器」上，否则 DuplicateOutput 直接失败。
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
         let adapter: IDXGIAdapter1 = unsafe { factory.EnumAdapters1(target.adapter_index)? };
@@ -229,6 +295,11 @@ impl DxgiCapture {
             width: target.width,
             height: target.height,
             discard_next_frame: true,
+            capture_cursor: options.capture_cursor,
+            pointer: PointerState::default(),
+            shape: None,
+            desktop_bgra: None,
+            force_desktop_copy: true,
         })
     }
 
@@ -260,7 +331,191 @@ impl DxgiCapture {
         let output1: IDXGIOutput1 = output.cast()?;
         self.duplication = unsafe { output1.DuplicateOutput(&self.device)? };
         self.discard_next_frame = true;
+        // 新会话的桌面内容与旧会话无关：缓存作废，形状也必须重取
+        //（尺寸/样式都可能因为 DPI 或主题变化而不同）。
+        self.desktop_bgra = None;
+        self.force_desktop_copy = true;
+        self.shape = None;
         Ok(())
+    }
+
+    /// 指针当前位置（区域坐标系）。用于测试与诊断。
+    pub fn pointer_state(&self) -> PointerState {
+        self.pointer
+    }
+
+    /// 当前形状尺寸，`None` 表示还没收到过任何形状。
+    pub fn cursor_shape_size(&self) -> Option<(u32, u32)> {
+        self.shape.as_ref().map(|s| (s.width(), s.height()))
+    }
+
+    /// 刷新指针位置与形状，返回「本帧是否有可见变化」。
+    ///
+    /// 必须在 `ReleaseFrame` **之前**调用：`GetFramePointerShape` 要求调用方仍持有帧，
+    /// 否则返回 `DXGI_ERROR_INVALID_CALL`。
+    fn update_pointer(&mut self, frame_info: &DXGI_OUTDUPL_FRAME_INFO) -> bool {
+        if !self.capture_cursor {
+            return false;
+        }
+        let mut changed = false;
+
+        // `LastMouseUpdateTime == 0` 表示这一帧根本没带指针更新——沿用上一状态，
+        // **不要**去读 `PointerPosition`（此时它是全 0，采信会让指针瞬移到左上角）。
+        if frame_info.LastMouseUpdateTime != 0 {
+            let pos = frame_info.PointerPosition;
+            // `Position` 是相对该输出左上角的坐标，换算到录制区域坐标。
+            let next = PointerState {
+                visible: pos.Visible.as_bool(),
+                x: pos.Position.x - self.offset_x,
+                y: pos.Position.y - self.offset_y,
+            };
+            // 位置没变就不算变化：否则鼠标每动一下都会逼下游重编码一帧相同画面。
+            if next != self.pointer {
+                self.pointer = next;
+                changed = true;
+            }
+        }
+
+        // 形状：`PointerShapeBufferSize > 0` 才代表**变了**；为 0 时不该重复取。
+        //
+        // 但**形状为空时必须无条件试一次**：刚建立复制会话时，形状不一定随着第一个
+        // 鼠标更新一起给出。实测会遇到「`PointerPosition` 一直在更新、形状却连续
+        // 几十帧都是空」的情况——若死守 `PointerShapeBufferSize > 0` 这个条件，
+        // 录制开头（甚至整段）都不会有指针。`GetFramePointerShape` 在持有帧期间
+        // 总能返回当前形状，不依赖该字段。
+        let may_need_shape = frame_info.PointerShapeBufferSize > 0 || self.shape.is_none();
+        if may_need_shape {
+            match self.fetch_cursor_shape(frame_info.PointerShapeBufferSize) {
+                Some(shape) => {
+                    // 形状换了（或首次拿到）必然要重画，即使位置完全没动。
+                    // GPU 侧按形状尺寸分配暂存纹理，所以尺寸变化也走这条。
+                    self.shape = Some(shape);
+                    changed = true;
+                }
+                None => {
+                    // 取不到（驱动给了怪数据 / 这一帧确实没有形状）：
+                    // 保留已有形状，别把上一帧的指针弄丢。
+                }
+            }
+        }
+
+        changed
+    }
+
+    /// 取一次指针形状。缓冲区不够时按 API 回填的 `required` 重试一次。
+    ///
+    /// `size_hint` 为 0 表示这次不是「形状变了」触发的主动探取：先用一个小缓冲试，
+    /// 真装不下时 API 会返回 `DXGI_ERROR_MORE_DATA` 并回填所需大小。
+    fn fetch_cursor_shape(&mut self, size_hint: u32) -> Option<CursorShape> {
+        // 形状缓冲区理论上最大也就几百 KB（256×256 的 32bpp 只有 256 KB）。
+        // 对异常值设上限，避免一次坏调用要求分配几百 MB。
+        const MAX_SHAPE_BYTES: u32 = 8 * 1024 * 1024;
+        /// 主动探取时的起步缓冲：绝大多数光标（16～64 px）都装得下。
+        const PROBE_BYTES: u32 = 64 * 1024;
+
+        let mut size = if size_hint == 0 {
+            PROBE_BYTES
+        } else if size_hint <= MAX_SHAPE_BYTES {
+            size_hint
+        } else {
+            return None;
+        };
+
+        let mut buf = vec![0u8; size as usize];
+        let mut required = 0u32;
+        let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+
+        let mut hr = unsafe {
+            self.duplication.GetFramePointerShape(
+                size,
+                buf.as_mut_ptr().cast(),
+                &mut required,
+                &mut info,
+            )
+        };
+        // 缓冲区不足时按真实所需大小重试一次（文档保证会回填 required）。
+        if let Err(e) = hr {
+            if e.code() == DXGI_ERROR_MORE_DATA && required > 0 && required <= MAX_SHAPE_BYTES {
+                size = required;
+                buf.resize(size as usize, 0);
+                hr = unsafe {
+                    self.duplication.GetFramePointerShape(
+                        size,
+                        buf.as_mut_ptr().cast(),
+                        &mut required,
+                        &mut info,
+                    )
+                };
+            } else {
+                return None;
+            }
+        }
+        hr.ok()?;
+        CursorShape::parse(info.Type, &info, &buf)
+    }
+
+    /// 把显存里的 region 那一块搬成紧凑行距的 CPU 缓冲。
+    fn copy_region_to_cpu(&mut self, frame_texture: &ID3D11Texture2D) -> WinResult<Arc<[u8]>> {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let ox = self.offset_x.max(0) as u32;
+        let oy = self.offset_y.max(0) as u32;
+
+        let out_w = (self.output_rect.right - self.output_rect.left).max(1) as u32;
+        let out_h = (self.output_rect.bottom - self.output_rect.top).max(1) as u32;
+
+        // 输出尺寸可能在运行时缩小（分辨率切换瞬间）：能拷多少拷多少，其余留黑。
+        let valid_w = w.min(out_w.saturating_sub(ox) as usize);
+        let valid_h = h.min(out_h.saturating_sub(oy) as usize);
+
+        // 紧凑行距（width*4）落地；只搬 region 那一块显存。
+        let mut bgra = vec![0u8; w * h * 4];
+        if valid_w == 0 || valid_h == 0 {
+            // 理论上不可达（region 必与输出有交集）；留黑帧好过返回 Err 中断录制。
+            return Ok(bgra.into());
+        }
+
+        let region = D3D11_BOX {
+            left: ox,
+            top: oy,
+            front: 0,
+            right: ox + valid_w as u32,
+            bottom: oy + valid_h as u32,
+            back: 1,
+        };
+        unsafe {
+            self.context.CopySubresourceRegion(
+                &self.staging,
+                0,
+                0,
+                0,
+                0,
+                frame_texture,
+                0,
+                Some(&region),
+            );
+        }
+
+        let mut mapped = Default::default();
+        unsafe {
+            self.context
+                .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        }
+
+        let src_stride = mapped.RowPitch as usize;
+        let src_base = mapped.pData as *const u8;
+        for row in 0..valid_h {
+            let src =
+                unsafe { std::slice::from_raw_parts(src_base.add(row * src_stride), valid_w * 4) };
+            let dst_off = row * w * 4;
+            bgra[dst_off..dst_off + valid_w * 4].copy_from_slice(src);
+        }
+
+        unsafe {
+            self.context.Unmap(&self.staging, 0);
+        }
+
+        Ok(bgra.into())
     }
 
     /// 采集一帧。`timeout_ms` 内无新帧返回 `Ok(None)`（对应 DXGI_ERROR_WAIT_TIMEOUT）。
@@ -304,65 +559,76 @@ impl DxgiCapture {
             return Ok(None);
         }
 
-        // 鼠标指针元数据（frame_info.PointerPosition）尚未合成，capture_cursor 字段预留。
-        let w = self.width as usize;
-        let h = self.height as usize;
-        let ox = self.offset_x.max(0) as u32;
-        let oy = self.offset_y.max(0) as u32;
+        // 指针状态必须在 ReleaseFrame **之前**刷新：`GetFramePointerShape` 要求
+        // 调用方仍持有帧，否则返回 DXGI_ERROR_INVALID_CALL。
+        let pointer_changed = self.update_pointer(&frame_info);
+        // 有无新的桌面像素。`force_desktop_copy` 覆盖「首帧 / 重建后」两种情况。
+        let desktop_updated = frame_info.AccumulatedFrames > 0 || self.force_desktop_copy;
 
-        let out_w = (self.output_rect.right - self.output_rect.left).max(1) as u32;
-        let out_h = (self.output_rect.bottom - self.output_rect.top).max(1) as u32;
-
-        // 输出尺寸可能在运行时缩小（分辨率切换瞬间）：能拷多少拷多少，其余留黑。
-        let valid_w = w.min(out_w.saturating_sub(ox) as usize);
-        let valid_h = h.min(out_h.saturating_sub(oy) as usize);
-
-        // 紧凑行距（width*4）落地；只搬 region 那一块显存。
-        let mut bgra = vec![0u8; w * h * 4];
-        if valid_w > 0 && valid_h > 0 {
-            let region = D3D11_BOX {
-                left: ox,
-                top: oy,
-                front: 0,
-                right: ox + valid_w as u32,
-                bottom: oy + valid_h as u32,
-                back: 1,
-            };
+        if self.discard_next_frame {
+            // 见字段注释：建立/重建 duplication 后的第一帧是未初始化图像。
+            // 这里**不**清 force_desktop_copy：这一帧没被采用，下一帧才是真正要拷的。
+            self.discard_next_frame = false;
             unsafe {
-                self.context.CopySubresourceRegion(
-                    &self.staging,
-                    0,
-                    0,
-                    0,
-                    0,
-                    &frame_texture,
-                    0,
-                    Some(&region),
-                );
+                let _ = self.duplication.ReleaseFrame();
             }
+            return Ok(None);
+        }
 
-            let mut mapped = Default::default();
+        // 桌面没变、指针也没动 → 与 WAIT_TIMEOUT 等价，让上层重发上一帧副本。
+        // 这条分支同时省掉一次整帧 memcpy（静止画面下这是常态）。
+        if !desktop_updated && !pointer_changed {
             unsafe {
-                self.context
-                    .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+                let _ = self.duplication.ReleaseFrame();
             }
+            return Ok(None);
+        }
 
-            let src_stride = mapped.RowPitch as usize;
-            let src_base = mapped.pData as *const u8;
-            for row in 0..valid_h {
-                let src = unsafe {
-                    std::slice::from_raw_parts(src_base.add(row * src_stride), valid_w * 4)
-                };
-                let dst_off = row * w * 4;
-                bgra[dst_off..dst_off + valid_w * 4].copy_from_slice(src);
+        if desktop_updated {
+            match self.copy_region_to_cpu(&frame_texture) {
+                Ok(buf) => {
+                    self.desktop_bgra = Some(buf);
+                    self.force_desktop_copy = false;
+                }
+                Err(e) => {
+                    unsafe {
+                        let _ = self.duplication.ReleaseFrame();
+                    }
+                    return Err(e);
+                }
             }
+        }
 
+        let Some(desktop) = self.desktop_bgra.as_ref() else {
+            // 取不到缓存（只可能出现在 force 逻辑被破坏时）；跳过这一帧好过返回坏图。
             unsafe {
-                self.context.Unmap(&self.staging, 0);
+                let _ = self.duplication.ReleaseFrame();
+            }
+            return Ok(None);
+        };
+
+        let w = self.width;
+        let h = self.height;
+        let stride = (w * 4) as usize;
+
+        // 指针合成。只有真的会画出像素时才复制整帧——1080p 一帧就是 8 MB，
+        // 静止画面上每帧复制一遍的代价不可忽略。
+        let composed: Option<Arc<[u8]>> = if self.capture_cursor && self.pointer.visible {
+            match self.shape.as_ref() {
+                Some(shape) => {
+                    let mut buf = desktop.to_vec();
+                    let touched =
+                        shape.blend_into(&mut buf, stride, w, h, self.pointer.x, self.pointer.y);
+                    if touched > 0 { Some(buf.into()) } else { None }
+                }
+                None => None,
             }
         } else {
-            // 理论上不可达（region 必与输出有交集）；留黑帧好过返回 Err 中断录制。
-        }
+            None
+        };
+
+        // 没合成（未开指针 / 光标不在区域内）时直接复用缓存：零拷贝。
+        let bgra = composed.unwrap_or_else(|| Arc::clone(desktop));
 
         unsafe {
             // ReleaseFrame 失败不影响本帧数据已拷贝的事实，忽略其错误。
@@ -370,18 +636,23 @@ impl DxgiCapture {
         }
 
         Ok(Some(CapturedFrame {
-            bgra: bgra.into(),
-            stride: (w * 4) as u32,
-            width: w as u32,
-            height: h as u32,
+            bgra,
+            stride: w * 4,
+            width: w,
+            height: h,
             qpc: qpc_now,
         }))
     }
 
-    /// GPU 零拷贝直接采集：获取原始 D3D11 纹理并在闭包中消费（显存内裁剪与编码），随后自动释放帧
+    /// GPU 零拷贝直接采集：获取原始 D3D11 纹理并在闭包中消费（显存内裁剪与编码），
+    /// 随后自动释放帧。
+    ///
+    /// 闭包额外拿到 [`FrameMeta`]：桌面是否真的更新了（`desktop_updated`），
+    /// 以及指针的当前状态（`pointer`，未开启指针合成时为 `None`）。
+    /// 前者让下游能跳过「只有指针动」时的整帧重拷。
     pub fn acquire_texture<F, R>(&mut self, timeout_ms: u32, f: F) -> WinResult<Option<R>>
     where
-        F: FnOnce(&ID3D11Texture2D) -> WinResult<R>,
+        F: FnOnce(&ID3D11Texture2D, FrameMeta<'_>) -> WinResult<R>,
     {
         let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = unsafe { std::mem::zeroed() };
         let mut resource: Option<windows::Win32::Graphics::Dxgi::IDXGIResource> = None;
@@ -406,13 +677,39 @@ impl DxgiCapture {
         };
         let frame_texture: ID3D11Texture2D = resource.cast()?;
 
+        let pointer_changed = self.update_pointer(&frame_info);
+        let desktop_updated = frame_info.AccumulatedFrames > 0 || self.force_desktop_copy;
+
         if self.discard_next_frame {
             self.discard_next_frame = false;
             let _ = unsafe { self.duplication.ReleaseFrame() };
             return Ok(None);
         }
 
-        let result = f(&frame_texture);
+        if !desktop_updated && !pointer_changed {
+            let _ = unsafe { self.duplication.ReleaseFrame() };
+            return Ok(None);
+        }
+
+        let meta = FrameMeta {
+            desktop_updated,
+            pointer: if self.capture_cursor {
+                Some(PointerFrame {
+                    state: self.pointer,
+                    shape: self.shape.as_ref(),
+                })
+            } else {
+                None
+            },
+        };
+
+        let result = f(&frame_texture, meta);
+
+        // 只有闭包成功接手之后才清掉强制重拷标记：闭包失败时下游的桌面副本
+        // 依旧是半旧的，下一帧还得再拷一次。
+        if desktop_updated && result.is_ok() {
+            self.force_desktop_copy = false;
+        }
 
         let _ = unsafe { self.duplication.ReleaseFrame() };
 

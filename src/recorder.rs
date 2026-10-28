@@ -23,7 +23,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::capture::wasapi::{AudioCapture, AudioSourceSpec};
-use crate::capture::{DxgiCapture, dxgi};
+use crate::capture::{CaptureOptions, DxgiCapture, dxgi};
 use crate::config::{AudioSourceType, EncoderPreference, RecordingConfig};
 use crate::encode::VideoEncoder;
 use crate::encode::aac::{AacEncoder, AacPacket};
@@ -277,7 +277,8 @@ impl Recorder {
             if let Ok(target) =
                 dxgi::find_target(cfg.region_x, cfg.region_y, cfg.region_w, cfg.region_h)
             {
-                if let Ok(capture) = DxgiCapture::new(&target) {
+                let options = CaptureOptions::with_cursor(cfg.capture_cursor);
+                if let Ok(capture) = DxgiCapture::new(&target, options) {
                     let mut capture_opt = Some(capture);
 
                     let raw = ContainerMode::RawFragmented;
@@ -924,9 +925,13 @@ fn gpu_recorder_thread(
         // 不能用帧序号 × 帧间隔——后者会在跟不上时把时间轴压扁。
         let pts_us = now.saturating_sub(start_qpc) * 1_000_000 / freq;
 
-        // 尝试零拷贝采集显存纹理并直接送入 GPU 编码器
-        let acquire_res = capture.acquire_texture(acquire_timeout_ms, |src_tex| {
-            gpu_sink.push_frame(src_tex, crop_x, crop_y, pts_us)
+        // 零拷贝采集显存纹理并直接送入 GPU 编码器。
+        //
+        // 闭包拿到 `FrameMeta`：桌面本帧是否真有新像素（「只有鼠标在动」时为 false，
+        // 不必再截一次显存）+ 指针状态。指针合成发生在 `push_frame` 内部、
+        // BGRA→NV12 之前，所以 H.264 与 HEVC/AV1 用的是同一份像素。
+        let acquire_res = capture.acquire_texture(acquire_timeout_ms, |src_tex, meta| {
+            gpu_sink.push_frame(src_tex, crop_x, crop_y, pts_us, meta)
         });
 
         match acquire_res {
@@ -939,7 +944,10 @@ fn gpu_recorder_thread(
             Ok(None) => {
                 // 静止画面
                 if !first_frame_seen {
-                    // 首帧尚未就绪，尝试 GDI 兜底抓一张注入显存
+                    // 首帧尚未就绪，尝试 GDI 兜底抓一张注入显存。
+                    // 注意：GDI 这条路拿不到指针形状（`GetFramePointerShape` 要求先持有
+                    // DXGI 帧），所以这张兜底首帧没有鼠标——只影响开头一两帧，
+                    // 紧随其后的 DXGI 帧就会带上。
                     if std::time::Instant::now() >= next_gdi_attempt {
                         next_gdi_attempt = std::time::Instant::now()
                             + std::time::Duration::from_millis(FIRST_FRAME_GDI_RETRY_MS);
@@ -1048,7 +1056,8 @@ fn capture_thread(
         }
     };
 
-    let mut capture = match DxgiCapture::new(&target) {
+    let options = CaptureOptions::with_cursor(cfg.capture_cursor);
+    let mut capture = match DxgiCapture::new(&target, options) {
         Ok(c) => c,
         Err(e) => {
             env.fail(

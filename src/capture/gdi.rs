@@ -12,6 +12,11 @@
 //! ## 与 DXGI 的差异
 //! GDI 抓的是「屏幕合成结果」，不含硬件覆盖层（部分全屏独占视频/游戏看不到），
 //! 因此只作兜底、不作常规路径。
+//!
+//! **也不含鼠标指针。** `BitBlt` 从来不把光标画进结果里，而指针形状只能从
+//! `IDXGIOutputDuplication::GetFramePointerShape` 拿（且要求先持有帧）。既然这条
+//! 路只在「接了 DXGI 但一直没有帧」时最多用一次，为了它再去开一次桌面复制不值得——
+//! 所以这张兜底首帧没有指针，紧随其后的 DXGI 帧就会有。见 [`super::cursor`]。
 
 use windows::Win32::Foundation::E_INVALIDARG;
 use windows::Win32::Graphics::Gdi::{
