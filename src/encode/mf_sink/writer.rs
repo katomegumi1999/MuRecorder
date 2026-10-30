@@ -23,7 +23,7 @@ use windows::Win32::Media::MediaFoundation::{
     MF_TRANSCODE_CONTAINERTYPE, MFAudioFormat_AAC, MFAudioFormat_PCM, MFCreateAttributes,
     MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateMemoryBuffer,
     MFCreateSample, MFCreateSinkWriterFromMediaSink, MFCreateSinkWriterFromURL, MFMediaType_Audio,
-    MFMediaType_Video, MFNominalRange_0_255, MFTranscodeContainerType_FMPEG4,
+    MFMediaType_Video, MFNominalRange_16_235, MFTranscodeContainerType_FMPEG4,
     MFTranscodeContainerType_MPEG4, MFVideoFormat_ARGB32, MFVideoFormat_AV1, MFVideoFormat_H264,
     MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709,
     MFVideoTransFunc_709, MFVideoTransferMatrix_BT709,
@@ -41,7 +41,7 @@ use crate::mux::nal::annexb_to_mp4_sample;
 use crate::mux::remux::{finalize_fragmented, finalize_plain};
 
 use super::converter::{
-    D3D11VideoConverter, MfRuntimeGuard, create_cursor_staging_texture, create_render_texture,
+    CsNv12Converter, MfRuntimeGuard, create_cursor_staging_texture, create_render_texture,
 };
 use super::probe::has_hardware_encoder;
 use super::types::{ContainerMode, GpuCodec, sample_description};
@@ -73,7 +73,7 @@ pub struct GpuSinkWriter {
     desktop_valid: bool,
     /// 指针包围盒的 CPU 回读暂存纹理（尺寸随光标变化重建）。
     cursor_staging: Option<(ID3D11Texture2D, u32, u32)>,
-    converter: Option<D3D11VideoConverter>,
+    converter: Option<CsNv12Converter>,
     width: u32,
     height: u32,
     fps: u32,
@@ -130,9 +130,10 @@ impl GpuSinkWriter {
             // 1. 创建用于裁剪区域的显存目标纹理 (GPU VRAM 零拷贝承载)
             let cropped_texture = create_render_texture(device, aligned_width, aligned_height)?;
 
-            // 2. 若启用 HEVC 或 AV1，构建 D3D11 VideoProcessor 显存内硬件颜色转换器 (BGRA -> NV12)
+            // 2. 若启用 H.264 / HEVC / AV1，构建 D3D11 Compute Shader 显存内高精度颜色转换器 (BGRA -> NV12)
+            // 采用 GPGPU 计算着色器，杜绝显卡驱动对 VideoProcessor 的视频增强与自动提亮滤镜，严格对齐 BT.709 标准
             let converter = if codec.requires_nv12() {
-                Some(D3D11VideoConverter::try_new(
+                Some(CsNv12Converter::try_new(
                     device,
                     context,
                     &cropped_texture,
@@ -211,6 +212,7 @@ impl GpuSinkWriter {
             const MF_MT_MPEG2_PROFILE: windows::core::GUID =
                 windows::core::GUID::from_u128(0xad76a00b_2d55_4e60_aa05_0207527019da);
             const E_AV_ENC_H265_V_PROFILE_MAIN_420_8: u32 = 1;
+            const E_AV_ENC_H264_V_PROFILE_HIGH: u32 = 100;
 
             match codec {
                 GpuCodec::Hevc => {
@@ -223,6 +225,7 @@ impl GpuSinkWriter {
                 }
                 GpuCodec::H264 => {
                     out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+                    out_type.SetUINT32(&MF_MT_MPEG2_PROFILE, E_AV_ENC_H264_V_PROFILE_HIGH)?;
                 }
             }
             out_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_bps)?;
@@ -231,18 +234,18 @@ impl GpuSinkWriter {
             set_attribute_ratio(&out_type, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
             out_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
 
-            // 显式写入 BT.709 色彩标准与全动态范围 (0-255) 元数据，杜绝播放器泛白发灰
+            // 显式写入 BT.709 色彩标准与有限动态范围 (16-235) 元数据，彻底匹配 OBS 与播放器标准色彩
             out_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
             out_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
             out_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
-            out_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255.0 as u32)?;
+            out_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
 
             let stream_index = sink_writer.AddStream(&out_type)?;
 
             // 7. 配置输入流格式
             // 核心要点：
-            // H.264 / HEVC / AV1 统一在 GPU 显存内通过 D3D11 VideoProcessor 完成零拷贝硬件转换，
-            // 直接传入标准 NV12（Full Range 0-255），杜绝 MF 内部插入多余软件转换器导致死锁或色彩劣化。
+            // H.264 / HEVC / AV1 统一在 GPU 显存内通过 D3D11 Compute Shader 完成高精度转换，
+            // 直接传入标准 NV12（Limited Range 16-235），杜绝 MF 内部插入多余软件转换器导致死锁或色彩劣化。
             let in_type: IMFMediaType = MFCreateMediaType()?;
             in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
             if codec.requires_nv12() {
@@ -250,7 +253,7 @@ impl GpuSinkWriter {
                 in_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
                 in_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
                 in_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
-                in_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255.0 as u32)?;
+                in_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
             } else {
                 in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_ARGB32)?;
             }
@@ -1225,7 +1228,6 @@ mod tests {
     }
 
     /// 需要真实硬件编码器与 MF 运行时；无头 CI / 无 GPU 环境请用 `--ignored` 显式启用。
-
     #[test]
     #[ignore = "需要真实 GPU 硬件编码器（本地手动验证）"]
     fn test_gpu_sink_writer_pipeline() {
