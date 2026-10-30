@@ -40,6 +40,7 @@ pub struct AacEncoder {
     output_queue: VecDeque<AacPacket>,
     output_cb_size: usize,
     mft_provides_output_sample: bool,
+    bitrate_kbps: u32,
 }
 
 impl AacEncoder {
@@ -117,19 +118,42 @@ impl AacEncoder {
         })?;
 
         // 1. 设置输出类型：48kHz / 2ch / Raw AAC / 指定码率
-        let avg_bytes_per_sec = (bitrate_kbps * 1000) / 8;
-        let out_type: IMFMediaType = unsafe { MFCreateMediaType()? };
-        unsafe {
-            out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-            out_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
-            out_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
-            out_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48_000)?;
-            out_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
-            out_type.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4)?;
-            out_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, avg_bytes_per_sec)?;
-            out_type.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)?; // 0 = Raw AAC (重要！)
-            out_type.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29)?; // AAC-LC
-            transform.SetOutputType(0, &out_type, 0)?;
+        // 现代 Windows 10/11 的 AAC MFT 已完全支持 320 kbps (40000 B/s) 立体声。
+        // 若在早期 Windows 版本上遇到白名单限制，阶梯式降级匹配下一档以保证兼容。
+        let fallback_tiers = [320u32, 256, 192, 160, 128, 96];
+        let mut set_output_ok = false;
+        let mut effective_kbps = bitrate_kbps;
+
+        let tiers_to_try: Vec<u32> = std::iter::once(bitrate_kbps)
+            .chain(fallback_tiers.into_iter().filter(|&k| k < bitrate_kbps))
+            .collect();
+
+        for try_kbps in tiers_to_try {
+            let avg_bytes_per_sec = (try_kbps * 1000) / 8;
+            let out_type: IMFMediaType = unsafe { MFCreateMediaType()? };
+            unsafe {
+                out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+                out_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
+                out_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
+                out_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48_000)?;
+                out_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+                out_type.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4)?;
+                out_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, avg_bytes_per_sec)?;
+                out_type.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)?; // 0 = Raw AAC
+                out_type.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29)?; // AAC-LC
+                if transform.SetOutputType(0, &out_type, 0).is_ok() {
+                    effective_kbps = try_kbps;
+                    set_output_ok = true;
+                    break;
+                }
+            }
+        }
+
+        if !set_output_ok {
+            return Err(WinError::new(
+                E_FAIL,
+                "AAC 编码器不支持任何配置的立体声输出格式",
+            ));
         }
 
         // 2. 设置输入类型：48kHz / 16bit / 2ch PCM
@@ -158,7 +182,13 @@ impl AacEncoder {
             output_queue: VecDeque::new(),
             output_cb_size,
             mft_provides_output_sample,
+            bitrate_kbps: effective_kbps,
         })
+    }
+
+    /// 当前实际生效的编码码率（kbps）。
+    pub fn bitrate_kbps(&self) -> u32 {
+        self.bitrate_kbps
     }
 
     /// 输入 PCM 数据（16-bit LE, 48kHz, 立体声，每采样点 4 字节）。
@@ -377,9 +407,11 @@ mod tests {
         for &kbps in &[96, 128, 160, 192, 256, 320] {
             let mut encoder = AacEncoder::with_bitrate_kbps(kbps)
                 .unwrap_or_else(|e| panic!("初始化 {kbps} kbps 编码器失败: {e}"));
-            let pcm = vec![0u8; 48000 * 4];
+            assert_eq!(encoder.bitrate_kbps(), kbps);
+            let pcm = vec![0x33u8; 48000 * 4];
             encoder.push_pcm(&pcm).unwrap();
-            let packets = encoder.drain().unwrap();
+            let mut packets = encoder.drain().unwrap();
+            packets.extend(encoder.finish().unwrap());
             assert!(!packets.is_empty(), "码率 {kbps} 应产出数据包");
         }
     }

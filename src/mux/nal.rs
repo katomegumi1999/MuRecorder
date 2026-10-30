@@ -233,6 +233,206 @@ fn unescape_ebsp(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// 简易位流读取器（用于解析 AV1 Sequence Header OBU）。
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit_offset: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            bit_offset: 0,
+        }
+    }
+
+    fn read_bits(&mut self, n: usize) -> Option<u32> {
+        if n == 0 {
+            return Some(0);
+        }
+        if n > 32 {
+            return None;
+        }
+        let mut res = 0u32;
+        for _ in 0..n {
+            let byte_idx = self.bit_offset / 8;
+            let bit_idx = 7 - (self.bit_offset % 8);
+            if byte_idx >= self.data.len() {
+                return None;
+            }
+            let bit = ((self.data[byte_idx] >> bit_idx) & 1) as u32;
+            res = (res << 1) | bit;
+            self.bit_offset += 1;
+        }
+        Some(res)
+    }
+}
+
+/// 构建 MP4 中的 `av1C` 配置盒（含 8 字节盒头 `size + b"av1C"`）。
+///
+/// 遵循 AOMedia AV1-ISOBMFF 规范中定义的 `AV1CodecConfigurationRecord`。
+///
+/// 输入 `header` 接受以下三种形态：
+/// 1. 完整的 `AV1CodecConfigurationRecord` 载荷（以 `0x81` 开头，marker=1, version=1）；
+/// 2. 含有 `OBU_SEQUENCE_HEADER` 的 OBU 码流（解析 Profile/Level 并打包为 configOBUs）；
+/// 3. 空字节切片（回退至标准的 Main Profile, Level 4.0, 8-bit 4:2:0 配置盒）。
+pub fn build_av1c(header: &[u8]) -> Option<Vec<u8>> {
+    // 1. 如果 header 已经是合法的 AV1CodecConfigurationRecord（第 1 字节高位 marker=1，低 7 位 version=1）
+    if header.len() >= 4 && (header[0] & 0x80) != 0 && (header[0] & 0x7F) == 1 {
+        return Some(build_box(b"av1C", header));
+    }
+
+    // 2. 尝试从 OBU 序列中寻找 OBU_SEQUENCE_HEADER (type = 1)
+    let mut seq_header_obu: Option<&[u8]> = None;
+    let mut offset = 0;
+    while offset < header.len() {
+        let b0 = header[offset];
+        if (b0 & 0x80) != 0 {
+            // forbidden bit 必须为 0
+            break;
+        }
+        let obu_type = (b0 >> 3) & 0x0F;
+        let extension = (b0 >> 2) & 1;
+        let has_size = (b0 >> 1) & 1;
+
+        let mut header_len = 1;
+        if extension != 0 {
+            if offset + 1 >= header.len() {
+                break;
+            }
+            header_len += 1;
+        }
+
+        let obu_start = offset;
+        offset += header_len;
+
+        let payload_size = if has_size != 0 {
+            let mut val = 0usize;
+            let mut shift = 0;
+            let mut ok = false;
+            while offset < header.len() {
+                let b = header[offset];
+                offset += 1;
+                val |= ((b & 0x7F) as usize) << shift;
+                if (b & 0x80) == 0 {
+                    ok = true;
+                    break;
+                }
+                shift += 7;
+                if shift >= 32 {
+                    break;
+                }
+            }
+            if !ok {
+                break;
+            }
+            val
+        } else {
+            header.len() - offset
+        };
+
+        let obu_end = (offset + payload_size).min(header.len());
+        let full_obu = &header[obu_start..obu_end];
+
+        if obu_type == 1 {
+            seq_header_obu = Some(full_obu);
+            break;
+        }
+        offset = obu_end;
+    }
+
+    if let Some(seq_obu) = seq_header_obu {
+        // 从 Sequence Header OBU 提取 profile 与 level
+        let b0 = seq_obu[0];
+        let extension = (b0 >> 2) & 1;
+        let has_size = (b0 >> 1) & 1;
+        let mut p_offset = 1 + extension as usize;
+        if has_size != 0 {
+            while p_offset < seq_obu.len() {
+                let b = seq_obu[p_offset];
+                p_offset += 1;
+                if (b & 0x80) == 0 {
+                    break;
+                }
+            }
+        }
+        let payload = &seq_obu[p_offset..];
+
+        let mut reader = BitReader::new(payload);
+        let seq_profile = reader.read_bits(3).unwrap_or(0) as u8;
+        let _still_picture = reader.read_bits(1);
+        let reduced_still = reader.read_bits(1).unwrap_or(0);
+        let (seq_level_idx_0, seq_tier_0) = if reduced_still != 0 {
+            (reader.read_bits(5).unwrap_or(8) as u8, 0u8)
+        } else {
+            let timing = reader.read_bits(1).unwrap_or(0);
+            if timing != 0 {
+                let _ = reader.read_bits(32);
+                let _ = reader.read_bits(32);
+                let equal_pic = reader.read_bits(1).unwrap_or(0);
+                if equal_pic != 0 {
+                    let mut zeros = 0;
+                    while reader.read_bits(1) == Some(0) && zeros < 32 {
+                        zeros += 1;
+                    }
+                    let _ = reader.read_bits(zeros);
+                }
+            }
+            let _initial_display_delay = reader.read_bits(1);
+            let _op_cnt = reader.read_bits(5);
+            let _op_idc = reader.read_bits(12);
+            let level = reader.read_bits(5).unwrap_or(8) as u8;
+            let tier = if level > 7 {
+                reader.read_bits(1).unwrap_or(0) as u8
+            } else {
+                0u8
+            };
+            (level, tier)
+        };
+
+        // AV1 常见屏幕录制配置（8-bit NV12 4:2:0）
+        // byte 2: tier(1b) | high_bitdepth(1b) | twelve_bit(1b) | monochrome(1b) | subsampling_x(1b) | subsampling_y(1b) | chroma_sample_position(2b)
+        // 4:2:0 时 subsampling_x=1, subsampling_y=1 => 0x0C
+        let byte2 = (seq_tier_0 << 7) | 0x0C;
+
+        let mut record = Vec::with_capacity(4 + seq_obu.len() + 2);
+        record.push(0x81); // marker=1, version=1
+        record.push((seq_profile << 5) | (seq_level_idx_0 & 0x1F));
+        record.push(byte2);
+        record.push(0x00); // delay_present=0
+
+        // configOBUs：如果 seq_obu 没有 size 字段，包装一个带 size 字段的 OBU 写入 configOBUs
+        if has_size != 0 {
+            record.extend_from_slice(seq_obu);
+        } else {
+            record.push(seq_obu[0] | 0x02);
+            if extension != 0 {
+                record.push(seq_obu[1]);
+            }
+            let p_len = payload.len();
+            let mut val = p_len;
+            while val >= 0x80 {
+                record.push(((val & 0x7F) as u8) | 0x80);
+                val >>= 7;
+            }
+            record.push((val & 0x7F) as u8);
+            record.extend_from_slice(payload);
+        }
+
+        return Some(build_box(b"av1C", &record));
+    }
+
+    // 3. 回退默认：Main Profile, Level 4.0, 8-bit 4:2:0
+    let default_record = [
+        0x81, // marker=1, version=1
+        0x08, // profile=0 (Main), level=8 (Level 4.0)
+        0x0C, // tier=0, 8-bit, 4:2:0 subsampling
+        0x00, // delay_present=0
+    ];
+    Some(build_box(b"av1C", &default_record))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +558,37 @@ mod tests {
         assert_eq!(unescape_ebsp(&[0, 0, 3, 0]), vec![0, 0, 0]);
         assert_eq!(unescape_ebsp(&[0, 0, 2]), vec![0, 0, 2]);
         assert_eq!(unescape_ebsp(&[0, 3, 0]), vec![0, 3, 0]);
+    }
+
+    #[test]
+    fn build_av1c_from_raw_record() {
+        let record = [0x81, 0x00, 0x0C, 0x00];
+        let box_data = build_av1c(&record).expect("av1C should build");
+        assert_eq!(&box_data[4..8], b"av1C");
+        assert_eq!(box_data[8], 0x81);
+        assert_eq!(box_data.len(), 12);
+    }
+
+    #[test]
+    fn build_av1c_from_empty_falls_back_to_main_profile() {
+        let box_data = build_av1c(&[]).expect("av1C fallback should build");
+        assert_eq!(&box_data[4..8], b"av1C");
+        assert_eq!(box_data[8], 0x81);
+        assert_eq!(box_data[9], 0x08); // Profile 0, Level 4.0
+        assert_eq!(box_data[10], 0x0C); // 4:2:0 subsampling
+        assert_eq!(box_data.len(), 12);
+    }
+
+    #[test]
+    fn build_av1c_from_sequence_header_obu() {
+        // OBU Sequence Header:
+        // Byte 0: obu_forbidden_bit=0, obu_type=1 (0b0001), obu_extension_flag=0, obu_has_size_field=1, obu_reserved=0 => 0x0A
+        // Byte 1: LEB128 size = 2 => 0x02
+        // Byte 2..3: payload = [0x00, 0x00]
+        let seq_obu = [0x0A, 0x02, 0x00, 0x00];
+        let box_data = build_av1c(&seq_obu).expect("av1C from OBU should build");
+        assert_eq!(&box_data[4..8], b"av1C");
+        assert_eq!(box_data[8], 0x81);
+        assert!(box_data.len() > 12); // Contains configOBUs
     }
 }

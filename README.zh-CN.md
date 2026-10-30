@@ -162,10 +162,21 @@ src/
 ├─ config.rs         配置校验（ABI 版本、fps、码率、区域）
 ├─ error.rs          错误码，与 recorder.h 一一对应
 ├─ stats.rs          原子计数器 + 滑动窗口采样
-├─ recorder.rs       状态机 + 线程流水线 + GPU/CPU 分派
+├─ recorder/         状态机 + 线程流水线 + GPU/CPU 分派
+│  ├─ mod.rs         Recorder 状态机、线程编排
+│  ├─ env.rs         流水线共享环境（停止/致命信号、错误记录）
+│  ├─ messages.rs    线程间消息类型
+│  ├─ audio.rs       音源解析、预检、静音补包、loopback 主循环
+│  ├─ gpu.rs         GPU 零拷贝录制线程
+│  └─ soft.rs        CPU 软编流水线（capture / encode / mux 线程）
 ├─ capture/dxgi.rs   Desktop Duplication、staging 纹理、QPC 配速
 ├─ capture/gdi.rs    一次性 BitBlt，仅用于静止画面补首帧
-├─ encode/mf_sink.rs MF SinkWriter、D3D11 视频处理器、编码器探测
+├─ encode/mf_sink/   MF SinkWriter、D3D11 视频处理器、编码器探测
+│  ├─ mod.rs         共享 MF 属性助手 + re-export
+│  ├─ writer.rs      GpuSinkWriter（媒体类型协商、帧注入、收尾）+ 测试
+│  ├─ converter.rs   MF 运行时守卫、BGRA→NV12 VideoProcessor、纹理助手
+│  ├─ probe.rs       硬件 MFT 枚举探测
+│  └─ types.rs       GpuCodec / ContainerMode / stsd 样本描述构建
 ├─ encode/sink_raw.rs 自研 IMFMediaSink（编码器交给 MF、写盒归自己）
 ├─ encode/soft.rs    OpenH264 封装 + Annex-B NAL 处理
 ├─ convert/i420.rs   整数 BT.709 BGRA → I420，2×2 色度抽样

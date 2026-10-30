@@ -1,7 +1,7 @@
 # 鼠标指针合成设计
 
 > 状态：**已实现**。对应 `capture/cursor.rs`（形状解析与 CPU 合成）、`capture/dxgi.rs`
-> （指针状态机）、`encode/mf_sink.rs`（显存内合成）。
+> （指针状态机）、`encode/mf_sink/writer.rs`（显存内合成）。
 > ABI 无需变更：`RecorderConfig.capture_cursor` 从 v1 起就在，此前一直被忽略。
 
 ## 1. 问题

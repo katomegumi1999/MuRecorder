@@ -44,8 +44,9 @@ use super::cursor::{Canvas, CursorShape, PointerState};
 /// 观感像闪一下；长于 500 ms 连续点击时会糊成一片。
 const RIPPLE_DURATION_US: u64 = 350_000;
 /// 波纹起始/终止半径（像素）。起点不是 0——从 0 开始的那几帧在视觉上等于没有。
-const RIPPLE_START_RADIUS: f32 = 5.0;
-const RIPPLE_END_RADIUS: f32 = 46.0;
+/// 终止半径设为 24px（直径 48px），紧凑优雅，刚好环抱标准 32x32 光标热点，避免扩散太大遮挡画面。
+const RIPPLE_START_RADIUS: f32 = 4.0;
+const RIPPLE_END_RADIUS: f32 = 24.0;
 /// 波纹初始不透明度（0–255）。不做全不透明，避免完全盖住下方内容。
 const RIPPLE_ALPHA: f32 = 235.0;
 /// 轨迹残影的初始不透明度与最大采样点数。
@@ -408,9 +409,19 @@ impl<'a> OverlayPlan<'a> {
         if let (Some(shape), Some((x, y))) = (self.shape, self.main) {
             merge(x, y, shape.width() as i32, shape.height() as i32);
         }
-        if let Some(shape) = self.shape {
-            for &(x, y, _) in &self.trail {
-                merge(x, y, shape.width() as i32, shape.height() as i32);
+        let (hx, hy) = self.shape.map_or((0, 0), |s| s.hotspot());
+        // 流光光轨外沿半径约为 6.5px（核心 + 外发光余量），样条曲线外拱增加余量至 12px
+        const TRAIL_PAD: i32 = 12;
+        for &(x, y, _) in &self.trail {
+            let px = x + hx;
+            let py = y + hy;
+            merge(px - TRAIL_PAD, py - TRAIL_PAD, TRAIL_PAD * 2, TRAIL_PAD * 2);
+        }
+        if let Some((mx, my)) = self.main {
+            if !self.trail.is_empty() {
+                let px = mx + hx;
+                let py = my + hy;
+                merge(px - TRAIL_PAD, py - TRAIL_PAD, TRAIL_PAD * 2, TRAIL_PAD * 2);
             }
         }
         for r in &self.ripples {
@@ -436,15 +447,11 @@ impl<'a> OverlayPlan<'a> {
     /// （CPU 路径传 `(0, 0)` 表示整帧，GPU 路径传回读包围盒的左上角）。
     /// 返回被改动过的像素数，调用方可据此判断这一帧是否真的需要重编码。
     ///
-    /// 绘制顺序是**残影 → 波纹 → 主光标**：波纹要压在旧残影上（否则残影会浮在
-    /// 圆环之上，看着像脏点），但不能盖住当前箭头（否则点击时反而看不清指到哪）。
+    /// 绘制顺序是**光轨 → 波纹 → 主光标**：波纹要压在流光上，主光标箭头置于最顶层
+    /// （保证光轨紧随指针尖端流出，同时完全不遮挡光标指针）。
     pub fn draw_into(&self, canvas: &mut Canvas<'_>, origin: (i32, i32)) -> usize {
         let mut touched = 0;
-        if let Some(shape) = self.shape {
-            for &(x, y, alpha) in &self.trail {
-                touched += shape.blend_into_alpha(canvas, x - origin.0, y - origin.1, alpha);
-            }
-        }
+        touched += draw_light_trail(canvas, origin, &self.trail, self.main, self.shape);
         for r in &self.ripples {
             touched += draw_ripple(canvas, origin, r);
         }
@@ -453,6 +460,276 @@ impl<'a> OverlayPlan<'a> {
         }
         touched
     }
+}
+
+/// 绘制流光光轨（Neon Streamer Light Trail）。
+///
+/// 沿着历史移动采样点平滑连接到当前鼠标尖端（热点），形成一束渐变流动的霓虹光轨：
+/// - 头部（靠近鼠标尖端）：光束较粗，带有明亮的纯白光核与青蓝发光；
+/// - 尾部（旧轨迹）：光束平滑收窄并淡出消散；
+/// - 视觉层级：内芯高亮白 [255, 255, 255] + 外缘青蓝霓虹光 [255, 229, 0]（BGRA 字节序）+ 光晕柔化。
+fn draw_light_trail(
+    canvas: &mut Canvas<'_>,
+    origin: (i32, i32),
+    trail: &[(i32, i32, u8)],
+    main: Option<(i32, i32)>,
+    shape: Option<&CursorShape>,
+) -> usize {
+    if trail.is_empty() {
+        return 0;
+    }
+
+    let (hx, hy) = shape.map_or((0, 0), |s| s.hotspot());
+
+    #[derive(Debug, Clone, Copy)]
+    struct TrailNode {
+        x: f32,
+        y: f32,
+        radius: f32,
+        alpha: f32,
+    }
+
+    let mut nodes = Vec::with_capacity(trail.len() + 1);
+    for &(tx, ty, a) in trail {
+        let norm_a = a as f32 / 255.0;
+        let radius = 0.8 + 2.8 * norm_a;
+        let alpha = (a as f32 * 0.9).clamp(0.0, 255.0);
+        nodes.push(TrailNode {
+            x: (tx + hx) as f32,
+            y: (ty + hy) as f32,
+            radius,
+            alpha,
+        });
+    }
+
+    if let Some((mx, my)) = main {
+        let head_x = (mx + hx) as f32;
+        let head_y = (my + hy) as f32;
+        let should_add = match nodes.last() {
+            Some(last) => {
+                let dx = head_x - last.x;
+                let dy = head_y - last.y;
+                dx * dx + dy * dy >= 1.0
+            }
+            None => true,
+        };
+        if should_add {
+            nodes.push(TrailNode {
+                x: head_x,
+                y: head_y,
+                radius: 3.8,
+                alpha: 220.0,
+            });
+        }
+    }
+
+    if nodes.is_empty() {
+        return 0;
+    }
+
+    // 使用 Chaikin 拐角细分平滑算法：将折线自然过渡为连续圆润的流线，且绝对不产生样条外拱自交
+    let curved_nodes = if nodes.len() >= 3 {
+        let mut cur = nodes;
+        for _ in 0..2 {
+            let mut next = Vec::with_capacity(cur.len() * 2);
+            if let Some(first) = cur.first() {
+                next.push(*first);
+            }
+            for i in 0..cur.len() - 1 {
+                let p0 = &cur[i];
+                let p1 = &cur[i + 1];
+                next.push(TrailNode {
+                    x: 0.75 * p0.x + 0.25 * p1.x,
+                    y: 0.75 * p0.y + 0.25 * p1.y,
+                    radius: 0.75 * p0.radius + 0.25 * p1.radius,
+                    alpha: 0.75 * p0.alpha + 0.25 * p1.alpha,
+                });
+                next.push(TrailNode {
+                    x: 0.25 * p0.x + 0.75 * p1.x,
+                    y: 0.25 * p0.y + 0.75 * p1.y,
+                    radius: 0.25 * p0.radius + 0.75 * p1.radius,
+                    alpha: 0.25 * p0.alpha + 0.75 * p1.alpha,
+                });
+            }
+            if let Some(last) = cur.last() {
+                next.push(*last);
+            }
+            cur = next;
+        }
+        cur
+    } else {
+        nodes
+    };
+
+    let w = canvas.width as i32;
+    let h = canvas.height as i32;
+    let stride = canvas.stride;
+    let dst: &mut [u8] = canvas.buf;
+    let reachable_rows = (dst.len() / stride) as i32;
+    let h_limit = h.min(reachable_rows);
+
+    let mut touched = 0usize;
+
+    let seg_count = if curved_nodes.len() == 1 { 1 } else { curved_nodes.len() - 1 };
+    let glow_pad = 2.4f32;
+
+    #[derive(Clone, Copy)]
+    struct Segment {
+        x0: f32,
+        y0: f32,
+        dx: f32,
+        dy: f32,
+        len_sq: f32,
+        r0: f32,
+        r1: f32,
+        a0: f32,
+        a1: f32,
+        min_x: f32,
+        max_x: f32,
+        min_y: f32,
+        max_y: f32,
+    }
+
+    let mut segments = Vec::with_capacity(seg_count);
+    let mut total_min_x = f32::MAX;
+    let mut total_max_x = f32::MIN;
+    let mut total_min_y = f32::MAX;
+    let mut total_max_y = f32::MIN;
+
+    for i in 0..seg_count {
+        let p0 = &curved_nodes[i];
+        let p1 = if curved_nodes.len() == 1 { p0 } else { &curved_nodes[i + 1] };
+
+        let dx = p1.x - p0.x;
+        let dy = p1.y - p0.y;
+        let len_sq = dx * dx + dy * dy;
+
+        let max_r = p0.radius.max(p1.radius);
+        let reach = max_r + glow_pad + 0.5;
+
+        let min_x = p0.x.min(p1.x) - reach;
+        let max_x = p0.x.max(p1.x) + reach;
+        let min_y = p0.y.min(p1.y) - reach;
+        let max_y = p0.y.max(p1.y) + reach;
+
+        total_min_x = total_min_x.min(min_x);
+        total_max_x = total_max_x.max(max_x);
+        total_min_y = total_min_y.min(min_y);
+        total_max_y = total_max_y.max(max_y);
+
+        segments.push(Segment {
+            x0: p0.x,
+            y0: p0.y,
+            dx,
+            dy,
+            len_sq,
+            r0: p0.radius,
+            r1: p1.radius,
+            a0: p0.alpha,
+            a1: p1.alpha,
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+        });
+    }
+
+    // 换算到画布坐标系并求交裁剪
+    let x0 = ((total_min_x - origin.0 as f32).floor() as i32).max(0);
+    let y0 = ((total_min_y - origin.1 as f32).floor() as i32).max(0);
+    let x1 = ((total_max_x - origin.0 as f32).ceil() as i32 + 1).min(w);
+    let y1 = ((total_max_y - origin.1 as f32).ceil() as i32 + 1).min(h_limit);
+
+    if x1 <= x0 || y1 <= y0 {
+        return 0;
+    }
+
+    for ty in y0..y1 {
+        let row_off = ty as usize * stride;
+        let py = ty as f32 + origin.1 as f32 + 0.5;
+        for tx in x0..x1 {
+            let px = tx as f32 + origin.0 as f32 + 0.5;
+
+            // 遍历所有相交线段，挑选视觉贡献最强（最高 Alpha / 核心度）的线段，严格单次合成
+            let mut best_color: Option<([u8; 3], f32)> = None;
+
+            for seg in &segments {
+                if px < seg.min_x || px > seg.max_x || py < seg.min_y || py > seg.max_y {
+                    continue;
+                }
+
+                let (t, dist_sq) = if seg.len_sq < 0.001 {
+                    let d2 = (px - seg.x0) * (px - seg.x0) + (py - seg.y0) * (py - seg.y0);
+                    (0.0, d2)
+                } else {
+                    let wx = px - seg.x0;
+                    let wy = py - seg.y0;
+                    let c1 = wx * seg.dx + wy * seg.dy;
+                    let t = (c1 / seg.len_sq).clamp(0.0, 1.0);
+                    let qx = seg.x0 + t * seg.dx;
+                    let qy = seg.y0 + t * seg.dy;
+                    let d2 = (px - qx) * (px - qx) + (py - qy) * (py - qy);
+                    (t, d2)
+                };
+
+                let r = seg.r0 + t * (seg.r1 - seg.r0);
+                let r_glow = r + glow_pad;
+                if dist_sq > r_glow * r_glow {
+                    continue;
+                }
+
+                let dist = dist_sq.sqrt();
+                let a_seg = seg.a0 + t * (seg.a1 - seg.a0);
+                let r_core = r * 0.45;
+
+                let (color, alpha) = if dist <= r_core {
+                    // 内芯：纯白高亮
+                    ([255u8, 255, 255], a_seg)
+                } else if dist <= r {
+                    // 核心到光柱边缘：白 -> 青蓝 [255, 229, 0] (BGRA)
+                    let u = (dist - r_core) / (r - r_core);
+                    let g = (255.0 - 26.0 * u).round() as u8;
+                    let r_ch = (255.0 * (1.0 - u)).round() as u8;
+                    ([255u8, g, r_ch], a_seg)
+                } else {
+                    // 光晕：青蓝色渐隐软过渡
+                    let u = (dist - r) / glow_pad;
+                    let cov = (1.0 - u).clamp(0.0, 1.0);
+                    let smooth_cov = cov * cov * (3.0 - 2.0 * cov);
+                    ([255u8, 229, 0], a_seg * smooth_cov * 0.7)
+                };
+
+                if alpha <= 0.5 {
+                    continue;
+                }
+
+                match &mut best_color {
+                    None => best_color = Some((color, alpha)),
+                    Some((_, best_a)) if alpha > *best_a => {
+                        best_color = Some((color, alpha));
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some((color, alpha)) = best_color {
+                let off = row_off + tx as usize * 4;
+                if off + 3 < dst.len() {
+                    let a = alpha.min(255.0);
+                    let inv = 255.0 - a;
+                    for c in 0..3 {
+                        dst[off + c] = ((color[c] as f32 * a + dst[off + c] as f32 * inv) / 255.0)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                    }
+                    dst[off + 3] = 0xFF;
+                    touched += 1;
+                }
+            }
+        }
+    }
+
+    touched
 }
 
 /// 画一个圆环：先用深色画粗一圈做描边，再用亮色画细一圈。
@@ -1031,5 +1308,33 @@ mod tests {
         };
         let (x, y, w, h) = plan.bounds(320, 240).unwrap();
         assert!(x + w <= 320 && y + h <= 240, "必须裁到画面内：{x}+{w}");
+    }
+
+    /// 流光光轨：能正确在线段周围绘制渐变与发光，且远处不受影响。
+    #[test]
+    fn light_trail_draws_streamer_and_tapers() {
+        let w = 100u32;
+        let h = 100u32;
+        let mut buf = vec![0x10u8; (w * h * 4) as usize];
+        let shape = color_shape(8, 8);
+        let plan = OverlayPlan {
+            shape: Some(&shape),
+            trail: vec![(20, 20, 100), (35, 35, 180)],
+            ripples: Vec::new(),
+            main: Some((50, 50)),
+        };
+        let mut canvas = Canvas::new(&mut buf, (w * 4) as usize, w, h);
+        let touched = plan.draw_into(&mut canvas, (0, 0));
+        assert!(touched > 0, "流光光轨应绘制像素");
+
+        // 中间路径 (35, 35) 附近应当被点亮
+        let px = |x: u32, y: u32| {
+            let off = (y * w * 4 + x * 4) as usize;
+            (buf[off], buf[off + 1], buf[off + 2]) // (B, G, R)
+        };
+        let mid = px(35, 35);
+        assert_ne!(mid, (0x10, 0x10, 0x10), "光轨路径点应被着色");
+        // 远离光轨的像素保持原样
+        assert_eq!(px(90, 10), (0x10, 0x10, 0x10), "远离光轨处不应被修改");
     }
 }

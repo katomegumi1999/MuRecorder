@@ -726,9 +726,11 @@ for (id, st) in sink.take_streams() {
 
 ## 9. 配置与 ABI
 
-**ABI 升到 v2**（`RECORDER_ABI_VERSION = 2`）。相比 v1 只在尾部追加了
+**本节写作时 ABI 升到 v2**（`RECORDER_ABI_VERSION = 2`）。相比 v1 只在尾部追加了
 `audio_bitrate_kbps` 一个字段，其余音频字段（`audio_source_type`、
 `audio_device_id`、`audio_window_hwnd`、`audio_process_id`）与四值枚举在 v1 就存在。
+（当前 ABI 已是 v3：v2 之上又在尾部追加了光标特效字段 `cursor_click_effect` /
+`cursor_trail_ms`，变更记录见 `include/recorder.h`；音频字段自 v2 起未再变动。）
 
 ```c
 uint32_t audio_source_type;  /* AudioSourceType */
@@ -852,7 +854,7 @@ reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, false)?;
 | `src/mux/extract.rs` | 双轨照抄与裁切（音频起点跟关键帧、**终点跟视频真实结束点**） |
 | `src/mux/remux.rs` | 双轨重建（按 `tfhd.track_ID` 归轨） |
 | `src/mux/mod.rs` | 模块文档更新 |
-| `src/recorder.rs` | 音频线程、`MuxMsg::{Video,Audio}` 通道、`pad_silence`、`preflight_audio`、`fatal_root` |
+| `src/recorder/` | 音频线程（`audio.rs`）、`MuxMsg::{Video,Audio}` 通道、`pad_silence`、`preflight_audio`、`fatal_root`（`env.rs`） |
 | `src/config.rs` | `ABI_VERSION` 1 → 2 + 版本历史说明 |
 | `tests/e2e_audio.rs` | **新建**：三个真录真解码的端到端用例 |
 | `Cargo.toml` | 加 `"Win32_Media_Audio"`（WASAPI）与 `"Win32_UI_WindowsAndMessaging"`（HWND → PID） |

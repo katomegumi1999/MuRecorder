@@ -2,7 +2,7 @@
 
 **A screen-recording engine for Windows, written in Rust, exposed as a C ABI.**
 
-DXGI Desktop Duplication → Media Foundation hardware encoder (H.264 / HEVC / AV1), with a pure-CPU fallback path (OpenH264 + a hand-written Hybrid MP4 muxer). Every path lands on a plain MP4 at stop, and recording is done as a crash-safe fragmented MP4 first — H.264 and HEVC both; AV1 is the one exception, because its samples and codec config record are shaped differently. No FFmpeg, no GStreamer — 9.7k lines of Rust (6.8k production + 2.9k tests) and the Windows API.
+DXGI Desktop Duplication → Media Foundation hardware encoder (H.264 / HEVC / AV1), with a pure-CPU fallback path (OpenH264 + a hand-written Hybrid MP4 muxer). Every path lands on a plain MP4 at stop, and recording is done as a crash-safe fragmented MP4 first — H.264 and HEVC both; AV1 is the one exception, because its samples and codec config record are shaped differently. No FFmpeg, no GStreamer — 16.2k lines of Rust (10.5k production + 5.7k tests) and the Windows API.
 
 Designed to be embedded in a .NET / Avalonia desktop app, but the C ABI is host-agnostic: anything that can load a `.dll` and pass a struct can drive it.
 
@@ -199,10 +199,21 @@ src/
 ├─ config.rs         RecorderConfig validation (abi version, fps, bitrate, region)
 ├─ error.rs          error codes, mirrored 1:1 with recorder.h
 ├─ stats.rs          atomic counters + sliding-window sampler
-├─ recorder.rs       state machine + thread pipeline + GPU/CPU dispatch
+├─ recorder/         state machine + thread pipeline + GPU/CPU dispatch
+│  ├─ mod.rs         Recorder state machine, thread orchestration
+│  ├─ env.rs         shared pipeline environment (stop/fatal flags, error log)
+│  ├─ messages.rs    inter-thread message types
+│  ├─ audio.rs       audio source parsing, preflight, silence padding, loopback loop
+│  ├─ gpu.rs         GPU zero-copy recording thread
+│  └─ soft.rs        CPU software pipeline (capture / encode / mux threads)
 ├─ capture/dxgi.rs   Desktop Duplication, staging texture, QPC pacing
 ├─ capture/gdi.rs    one-shot BitBlt, first frame for static screens only
-├─ encode/mf_sink.rs Media Foundation SinkWriter, D3D11 video processor, encoder probing
+├─ encode/mf_sink/   Media Foundation SinkWriter, D3D11 video processor, encoder probing
+│  ├─ mod.rs         shared MF attribute helpers + re-exports
+│  ├─ writer.rs      GpuSinkWriter (media types, frame injection, finalize) + tests
+│  ├─ converter.rs   MF runtime guard, BGRA→NV12 VideoProcessor, texture helpers
+│  ├─ probe.rs       hardware MFT enumeration
+│  └─ types.rs       GpuCodec / ContainerMode / stsd sample description
 ├─ encode/sink_raw.rs custom IMFMediaSink (MF encodes, we write the boxes)
 ├─ encode/soft.rs    OpenH264 wrapper + Annex-B NAL handling
 ├─ convert/i420.rs   integer BT.709 BGRA → I420, 2×2 chroma subsampling
@@ -251,7 +262,7 @@ The GPU path skips this entirely. Numbers include three per-frame `Vec` allocati
 ## Building and testing
 
 ```bash
-cargo test                    # 79 tests: ABI guards, state machine, NAL splitting,
+cargo test                    # 162 tests: ABI guards, state machine, NAL splitting,
                               # BT.709 math, bitrate control, MP4 box tree
                               # (Hybrid layout, fMP4 recording state, per-fragment
                               # chunks, 64-bit mdat / mdhd v1), Annex B → length

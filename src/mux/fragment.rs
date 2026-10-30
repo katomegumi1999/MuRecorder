@@ -632,3 +632,516 @@ fn parse_trun(body: &[u8], defaults: &SampleDefaults) -> io::Result<(Option<i32>
     }
     Ok((data_offset, runs))
 }
+
+#[cfg(test)]
+mod tests {
+    //! 测试策略：所有输入都是**手工构造的合成字节流**，不依赖任何真实录制文件。
+    //! 两组风格都覆盖：本仓库 `Mp4Muxer` 的写法（`tfhd` 默认值 + `tfdt` v1）
+    //! 与 Media Foundation 的写法（显式 `base_data_offset`、不写 `tfdt`、
+    //! 时长/尺寸走 `trex` 回退、v1 `trun` 带符号 `cts`）。
+
+    use super::*;
+
+    // -------------------------------------------------------------- 构盒工具
+
+    /// 32 位长度的普通盒。
+    fn box_full(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(8 + payload.len());
+        v.extend_from_slice(&((payload.len() as u32 + 8).to_be_bytes()));
+        v.extend_from_slice(kind);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// `size==1` + 64 位 largesize 的盒。
+    fn box_large(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0, 0, 0, 1];
+        v.extend_from_slice(kind);
+        v.extend_from_slice(&((payload.len() as u64 + 16).to_be_bytes()));
+        v.extend_from_slice(payload);
+        v
+    }
+
+    fn be32(v: u32) -> Vec<u8> {
+        v.to_be_bytes().to_vec()
+    }
+
+    /// 构造一个最小但合法的单轨 init moov payload：
+    /// mvhd(1000) + mvex(trex) + trak(tkhd v0 + mdia(mdhd + hdlr + minf(stbl(stsd))))。
+    fn sample_moov(track_id: u32, trex: Option<(u32, u32, u32)>) -> Vec<u8> {
+        // mvhd v0：body 前 12 字节后是 timescale
+        let mut mvhd_payload = vec![0u8; 12];
+        mvhd_payload.extend_from_slice(&1000u32.to_be_bytes());
+        mvhd_payload.extend_from_slice(&0u32.to_be_bytes()); // duration
+
+        let tkhd = {
+            let mut body = vec![0u8; 16]; // version/flags + (creation, modification) + ...
+            body[12..16].copy_from_slice(&track_id.to_be_bytes());
+            box_full(b"tkhd", &body)
+        };
+        let mdhd = {
+            let mut body = vec![0u8; 12];
+            body.extend_from_slice(&90000u32.to_be_bytes()); // media timescale
+            body.extend_from_slice(&0u32.to_be_bytes());
+            box_full(b"mdhd", &body)
+        };
+        let hdlr_body = {
+            let mut b = vec![0u8; 8];
+            b.extend_from_slice(b"vide");
+            b
+        };
+        let hdlr_box = box_full(b"hdlr", &hdlr_body);
+        let stsd = box_full(b"stsd", &[0xAA; 16]);
+        let stbl = box_full(b"stbl", &stsd);
+        let minf = box_full(b"minf", &stbl);
+        let mdia = box_full(b"mdia", &[mdhd, hdlr_box.clone(), minf].concat());
+        let trak = box_full(b"trak", &[tkhd, mdia].concat());
+
+        let mvex = trex.map(|(duration, size, flags)| {
+            let mut body = vec![0u8; 4]; // version/flags
+            body.extend_from_slice(&track_id.to_be_bytes());
+            body.extend_from_slice(&duration.to_be_bytes());
+            body.extend_from_slice(&size.to_be_bytes());
+            body.extend_from_slice(&flags.to_be_bytes());
+            body.extend_from_slice(&0u32.to_be_bytes()); // 补齐到 24 B，flags 才会被解析
+            box_full(b"mvex", &box_full(b"trex", &body))
+        });
+
+        let mut children = vec![box_full(b"mvhd", &mvhd_payload), hdlr_box, trak];
+        if let Some(m) = mvex {
+            children.push(m);
+        }
+        children.concat()
+    }
+
+    /// 单轨 `TrackLayout`（单轨场景的便捷构造）。
+    fn single_layout(track_id: u32, defaults: (u32, u32, u32)) -> TrackLayout {
+        TrackLayout {
+            track_id,
+            movie_timescale: 1000,
+            media_timescale: 90000,
+            defaults: SampleDefaults {
+                duration: defaults.0,
+                size: defaults.1,
+                flags: defaults.2,
+            },
+            stsd: vec![0xAB; 8],
+            handler_type: *b"vide",
+        }
+    }
+
+    /// 本仓库风格的 moof：`tfhd` flags=0x020000（default-base-is-moof），
+    /// `tfdt` v1，`trun` 逐样本 duration/size/flags。
+    fn muxer_style_moof(dts: u64, samples: &[(u32, u32, u32)], data_offset: i32) -> Vec<u8> {
+        // tfhd：flags 0x020000 + track_ID，无默认值
+        let mut tfhd = vec![0x00, 0x02, 0x00, 0x00];
+        tfhd.extend_from_slice(&1u32.to_be_bytes());
+
+        // tfdt v1：64 位 baseMediaDecodeTime
+        let mut tfdt = vec![1u8, 0, 0, 0];
+        tfdt.extend_from_slice(&dts.to_be_bytes());
+
+        // trun：data-offset + per-sample duration/size/flags
+        let flags: u32 = 0x0000_0001 | 0x0000_0100 | 0x0000_0200 | 0x0000_0400;
+        let mut trun = Vec::new();
+        trun.extend_from_slice(&[0u8, (flags >> 16) as u8, (flags >> 8) as u8, flags as u8]);
+        trun.extend_from_slice(&(samples.len() as u32).to_be_bytes());
+        trun.extend_from_slice(&data_offset.to_be_bytes());
+        for &(duration, size, sample_flags) in samples {
+            trun.extend_from_slice(&duration.to_be_bytes());
+            trun.extend_from_slice(&size.to_be_bytes());
+            trun.extend_from_slice(&sample_flags.to_be_bytes());
+        }
+
+        let traf = box_full(
+            b"traf",
+            &[
+                box_full(b"tfhd", &tfhd),
+                box_full(b"tfdt", &tfdt),
+                box_full(b"trun", &trun),
+            ]
+            .concat(),
+        );
+        let mfhd = box_full(b"mfhd", &be32(1));
+        box_full(b"moof", &[mfhd, traf].concat())
+    }
+
+    // ------------------------------------------------------------ split_boxes
+
+    #[test]
+    fn split_boxes_parses_sibling_boxes() {
+        let a = box_full(b"free", &[1, 2, 3]);
+        let b = box_full(b"moof", &[4]);
+        let buf = [a.as_slice(), b.as_slice()].concat();
+        let boxes = split_boxes(&buf).unwrap();
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(&boxes[0].kind, b"free");
+        assert_eq!(boxes[0].header_len, 8);
+        assert_eq!(&boxes[1].kind, b"moof");
+    }
+
+    /// `size==0` 的盒表示「延伸到 payload 末尾」（ISO 14496-12 §4.2）。
+    #[test]
+    fn split_boxes_zero_size_extends_to_end() {
+        let mut a = box_full(b"free", &[1]);
+        let b = box_full(b"mdat", &[9; 4]);
+        a[0..4].copy_from_slice(&0u32.to_be_bytes());
+        let buf = [a.as_slice(), b.as_slice()].concat();
+        let boxes = split_boxes(&buf).unwrap();
+        assert_eq!(boxes.len(), 1, "size==0 的 free 吞掉了后面的字节");
+        assert_eq!(&boxes[0].kind, b"free");
+        assert_eq!(boxes[0].size, buf.len());
+    }
+
+    /// `size==1` 走 64 位 largesize，盒头为 16 字节。
+    #[test]
+    fn split_boxes_largesize_header() {
+        let big = box_large(b"mdat", &[7; 100]);
+        let boxes = split_boxes(&big).unwrap();
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].header_len, 16);
+        assert_eq!(boxes[0].size, 116);
+    }
+
+    #[test]
+    fn split_boxes_rejects_truncated_and_overrun() {
+        // 头被截断：声明 largesize 但 16 字节头不完整
+        let mut truncated = box_large(b"mdat", &[7; 8]);
+        truncated.truncate(12);
+        assert!(split_boxes(&truncated).is_err());
+
+        // 声明长度越界
+        let mut bad = box_full(b"mdat", &[7; 4]);
+        bad[0..4].copy_from_slice(&999u32.to_be_bytes());
+        assert!(split_boxes(&bad).is_err());
+    }
+
+    // ---------------------------------------------------------- descend / body
+
+    #[test]
+    fn descend_full_drills_path_and_box_body_strips_header() {
+        let stsd = box_full(b"stsd", &[0xCC; 8]);
+        let stbl = box_full(b"stbl", &stsd);
+        let minf = box_full(b"minf", &stbl);
+        let mdia = box_full(b"mdia", &minf);
+
+        // descend_full 的入参是 payload（不含外层盒头），与生产代码用法一致
+        let payload = box_body(&mdia).unwrap();
+        let full = descend_full(payload, &[*b"minf", *b"stbl", *b"stsd"]).unwrap();
+        assert_eq!(full.len(), 8 + 8);
+        assert_eq!(&full[4..8], b"stsd");
+
+        let body = box_body(full).unwrap();
+        assert_eq!(body, &[0xCC; 8]);
+
+        // 缺失的盒必须报错，而不是静默返回空
+        assert!(descend_full(payload, &[*b"minf", *b"stsd"]).is_err());
+    }
+
+    // ------------------------------------------------------------ scan_top_level
+
+    #[test]
+    fn scan_top_level_reads_boxes_and_ignores_truncated_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scan.mp4");
+        let a = box_full(b"ftyp", &[0; 8]);
+        let b = box_large(b"mdat", &[1; 32]);
+        // 末尾故意留一个半截盒（录制中被截断的常态）
+        let mut bytes = [a.as_slice(), b.as_slice()].concat();
+        bytes.extend_from_slice(&[0, 0, 1, 0]); // 声明了 256 字节但只有 4 字节
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut f = File::open(&path).unwrap();
+        let len = f.metadata().unwrap().len();
+        let boxes = scan_top_level(&mut f, len).unwrap();
+        assert_eq!(boxes.len(), 2, "半截盒必须被忽略");
+        assert_eq!(&boxes[0].kind, b"ftyp");
+        assert_eq!(boxes[0].header_len, 8);
+        assert_eq!(&boxes[1].kind, b"mdat");
+        assert_eq!(boxes[1].header_len, 16, "largesize 盒头应为 16 字节");
+
+        let payload = read_at(&mut f, boxes[1].offset + 16, boxes[1].size - 16).unwrap();
+        assert_eq!(payload, vec![1; 32]);
+    }
+
+    // -------------------------------------------------------------- parse_layouts
+
+    #[test]
+    fn parse_layouts_reads_timescales_stsd_and_trex_defaults() {
+        let moov = sample_moov(1, Some((33, 120, 0x0200_0000)));
+        let layouts = parse_layouts(&moov).unwrap();
+        let layout = layouts.get(&1).expect("track 1 必须存在");
+
+        assert_eq!(layout.movie_timescale, 1000);
+        assert_eq!(layout.media_timescale, 90000);
+        assert_eq!(&layout.handler_type, b"vide");
+        assert_eq!(layout.defaults.duration, 33);
+        assert_eq!(layout.defaults.size, 120);
+        assert_eq!(layout.defaults.flags, 0x0200_0000);
+        // stsd 必须逐字节保留（含盒头）——上层靠它原样拷贝 avcC/hvcC/av1C
+        assert_eq!(&layout.stsd[4..8], b"stsd");
+        assert_eq!(
+            layout.stsd.len(),
+            8 + 16,
+            "stsd 完整盒 = 8 字节盒头 + 16 字节 payload"
+        );
+    }
+
+    #[test]
+    fn parse_layouts_rejects_moov_without_trak() {
+        let moov = box_full(b"mvhd", &[0u8; 20]);
+        assert!(parse_layouts(&moov).is_err());
+    }
+
+    // -------------------------------------------------------- parse_fragment_multi
+
+    /// 本仓库 muxer 风格：default-base-is-moof + tfdt v1 + 逐样本全字段 trun。
+    #[test]
+    fn parse_fragment_multi_handles_muxer_style_fragment() {
+        let layouts = std::collections::HashMap::from([(1u32, single_layout(1, (0, 0, 0)))]);
+        // 两个样本：关键帧(10 B) + 非同步帧(12 B)；基址取 moof 绝对偏移 4096
+        let moof = muxer_style_moof(5_000, &[(33, 10, 0x0200_0000), (33, 12, 0x0101_0000)], 100);
+        let moof_abs = 4096u64;
+
+        let mut track_samples = std::collections::HashMap::new();
+        parse_fragment_multi(&moof, moof_abs, &layouts, &mut track_samples).unwrap();
+
+        let samples = &track_samples[&1];
+        assert_eq!(samples.len(), 2);
+        // base = moof_abs（default-base-is-moof），cursor = base + data_offset
+        assert_eq!(samples[0].offset, 4096 + 100);
+        assert_eq!(samples[1].offset, 4096 + 100 + 10);
+        assert_eq!(samples[0].dts, 5_000);
+        assert_eq!(samples[1].dts, 5_033);
+        assert_eq!(samples[0].duration, 33);
+        assert_eq!(samples[0].size, 10);
+        assert_eq!(samples[1].size, 12);
+        assert!(samples[0].is_key, "bit16 未置位应为关键帧");
+        assert!(!samples[1].is_key, "bit16 置位应为非同步样本");
+        assert_eq!(samples[0].cts, 0);
+    }
+
+    /// MF 风格：显式 `base_data_offset`、不写 `tfdt`（dts 从上一片延续）、
+    /// 时长/尺寸走 `trex` 默认、v1 `trun` 带符号 `cts`（B 帧）。
+    #[test]
+    fn parse_fragment_multi_handles_media_foundation_style_fragment() {
+        let layouts = std::collections::HashMap::from([(1u32, single_layout(1, (40, 5, 0)))]);
+        // tfhd：flags 0x000001（显式 base_data_offset = 2048）
+        let mut tfhd = vec![0x00, 0x00, 0x00, 0x01];
+        tfhd.extend_from_slice(&1u32.to_be_bytes());
+        tfhd.extend_from_slice(&2048u64.to_be_bytes());
+
+        // trun v1：data-offset + cts（合成偏移 -2），duration/size 全走默认
+        // 注意 flags 是 24 位大端：0x000801 → 字节 [0x00, 0x08, 0x01]
+        let mut trun = vec![1u8, 0x00, 0x08, 0x01];
+        trun.extend_from_slice(&1u32.to_be_bytes());
+        trun.extend_from_slice(&16i32.to_be_bytes());
+        trun.extend_from_slice(&(-2i32).to_be_bytes());
+
+        // 不写 tfdt：dts 应从 track 已有样本延续
+        let traf = box_full(
+            b"traf",
+            &[box_full(b"tfhd", &tfhd), box_full(b"trun", &trun)].concat(),
+        );
+        let moof = box_full(
+            b"moof",
+            &box_full(b"mfhd", &be32(1))
+                .into_iter()
+                .chain(traf)
+                .collect::<Vec<u8>>(),
+        );
+
+        let mut track_samples = std::collections::HashMap::from([(
+            1u32,
+            vec![SampleInfo {
+                offset: 0,
+                dts: 1_000,
+                duration: 33,
+                cts: 0,
+                is_key: true,
+                size: 5,
+            }],
+        )]);
+        parse_fragment_multi(&moof, 0, &layouts, &mut track_samples).unwrap();
+
+        let samples = &track_samples[&1];
+        assert_eq!(samples.len(), 2);
+        let s = &samples[1];
+        assert_eq!(s.offset, 2048 + 16, "base_data_offset + trun data_offset");
+        assert_eq!(s.dts, 1_033, "无 tfdt 时 dts 应延续上一片");
+        assert_eq!(s.duration, 40, "trun 未给时长应走 trex 默认");
+        assert_eq!(s.size, 5, "trun 未给尺寸应走 trex 默认");
+        assert_eq!(s.cts, -2, "v1 trun 的 cts 应按有符号解析");
+        assert!(s.is_key, "默认 flags=0 应视为关键帧");
+    }
+
+    /// tfhd 自带默认值时必须压过 trex（ISO 语义：作用域越近优先级越高）。
+    #[test]
+    fn parse_fragment_multi_tfhd_defaults_override_trex() {
+        let layouts = std::collections::HashMap::from([(1u32, single_layout(1, (999, 999, 0)))]);
+        // tfhd：flags 0x000018（default_sample_duration + default_sample_size）
+        let mut tfhd = vec![0x00, 0x00, 0x00, 0x18];
+        tfhd.extend_from_slice(&1u32.to_be_bytes());
+        tfhd.extend_from_slice(&25u32.to_be_bytes()); // duration
+        tfhd.extend_from_slice(&7u32.to_be_bytes()); // size
+
+        // trun：只给 count（0x000000），字段全走默认
+        let trun = {
+            let mut b = vec![0u8, 0x00, 0x00, 0x00];
+            b.extend_from_slice(&2u32.to_be_bytes());
+            b
+        };
+        let traf = box_full(
+            b"traf",
+            &[box_full(b"tfhd", &tfhd), box_full(b"trun", &trun)].concat(),
+        );
+        let moof = box_full(
+            b"moof",
+            &box_full(b"mfhd", &be32(1))
+                .into_iter()
+                .chain(traf)
+                .collect::<Vec<u8>>(),
+        );
+
+        let mut track_samples = std::collections::HashMap::new();
+        parse_fragment_multi(&moof, 100, &layouts, &mut track_samples).unwrap();
+
+        let samples = &track_samples[&1];
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].duration, 25, "tfhd 默认应压过 trex");
+        assert_eq!(samples[0].size, 7);
+        // 无 data_offset 的 trun：cursor 从 base 连续推进
+        assert_eq!(samples[0].offset, 100);
+        assert_eq!(samples[1].offset, 107);
+        assert_eq!(samples[0].dts, 0, "无 tfdt 且无前序样本时 dts 从 0 起");
+        assert_eq!(samples[1].dts, 25, "dts 按默认时长逐样本推进");
+    }
+
+    /// traf 引用 init moov 未定义的 track_ID 必须报错，不能静默丢样本。
+    #[test]
+    fn parse_fragment_multi_rejects_unknown_track_id() {
+        let layouts = std::collections::HashMap::from([(1u32, single_layout(1, (33, 10, 0)))]);
+        let mut tfhd = vec![0x00, 0x02, 0x00, 0x00];
+        tfhd.extend_from_slice(&7u32.to_be_bytes()); // 未定义的 track
+        let trun = {
+            let mut b = vec![0u8, 0x00, 0x00, 0x00];
+            b.extend_from_slice(&1u32.to_be_bytes());
+            b
+        };
+        let traf = box_full(
+            b"traf",
+            &[box_full(b"tfhd", &tfhd), box_full(b"trun", &trun)].concat(),
+        );
+        let moof = box_full(
+            b"moof",
+            &box_full(b"mfhd", &be32(1))
+                .into_iter()
+                .chain(traf)
+                .collect::<Vec<u8>>(),
+        );
+
+        let mut track_samples = std::collections::HashMap::new();
+        assert!(parse_fragment_multi(&moof, 0, &layouts, &mut track_samples).is_err());
+    }
+
+    // -------------------------------------------------------- fill_missing_durations
+
+    #[test]
+    fn fill_missing_durations_derives_from_next_dts_and_falls_back() {
+        let mut samples = vec![
+            SampleInfo {
+                offset: 0,
+                dts: 0,
+                duration: 0,
+                cts: 0,
+                is_key: true,
+                size: 1,
+            },
+            SampleInfo {
+                offset: 1,
+                dts: 33,
+                duration: 0,
+                cts: 0,
+                is_key: false,
+                size: 1,
+            },
+            SampleInfo {
+                offset: 2,
+                dts: 66,
+                duration: 0,
+                cts: 0,
+                is_key: false,
+                size: 1,
+            },
+        ];
+        fill_missing_durations(&mut samples, 40);
+        // 前两个样本由后继 dts 差推出 33；末样本无后继，回退前一个样本的时长
+        assert_eq!(samples[0].duration, 33);
+        assert_eq!(samples[1].duration, 33);
+        assert_eq!(samples[2].duration, 33, "末样本应回退到前一样本的时长");
+    }
+
+    #[test]
+    fn fill_missing_durations_uses_nominal_for_single_sample() {
+        let mut samples = vec![SampleInfo {
+            offset: 0,
+            dts: 0,
+            duration: 0,
+            cts: 0,
+            is_key: true,
+            size: 1,
+        }];
+        fill_missing_durations(&mut samples, 41);
+        assert_eq!(samples[0].duration, 41, "孤立样本应使用标称帧间隔兜底");
+    }
+
+    #[test]
+    fn fill_missing_durations_is_noop_when_all_present() {
+        let mut samples = vec![SampleInfo {
+            offset: 0,
+            dts: 0,
+            duration: 33,
+            cts: 0,
+            is_key: true,
+            size: 1,
+        }];
+        fill_missing_durations(&mut samples, 0);
+        assert_eq!(samples[0].duration, 33, "已有时长绝不能被覆盖");
+    }
+
+    // -------------------------------------------------------------- parse_layout（单轨兼容层）
+
+    #[test]
+    fn parse_layout_rejects_multi_track() {
+        let trak2 = {
+            let tkhd = {
+                let mut body = vec![0u8; 16];
+                body[12..16].copy_from_slice(&2u32.to_be_bytes());
+                box_full(b"tkhd", &body)
+            };
+            let mdhd = {
+                let mut body = vec![0u8; 12];
+                body.extend_from_slice(&48000u32.to_be_bytes());
+                body.extend_from_slice(&0u32.to_be_bytes());
+                box_full(b"mdhd", &body)
+            };
+            let hdlr = {
+                let mut body = vec![0u8; 8];
+                body.extend_from_slice(b"soun");
+                box_full(b"hdlr", &body)
+            };
+            let stsd = box_full(b"stsd", &[0xBB; 8]);
+            let mdia = box_full(
+                b"mdia",
+                &[mdhd, hdlr, box_full(b"minf", &box_full(b"stbl", &stsd))].concat(),
+            );
+            box_full(b"trak", &[tkhd, mdia].concat())
+        };
+        let moov = [sample_moov(1, None), trak2].concat();
+        let err = parse_layout(&moov).expect_err("双轨必须被单轨兼容层拒绝");
+        assert!(
+            err.to_string().contains("2"),
+            "错误信息应给出实际轨道数，实际：{err}"
+        );
+    }
+}

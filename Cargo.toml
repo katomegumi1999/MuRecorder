@@ -31,6 +31,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Performance",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_System_Ole",
     # 自己实现 IMFMediaSink / IMFStreamSink 需要这两个：前者的方法签名带
     # PROPVARIANT（System_Variant），后者在 Com_StructuredStorage 里定义
     # （PROPVARIANT 本体，以及 IMFStreamSink_Impl / IMFMediaEventGenerator_Impl

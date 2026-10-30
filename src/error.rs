@@ -41,7 +41,6 @@ pub struct RecorderError {
     message: String,
 }
 
-#[allow(dead_code)] // no_encoder/device_lost/message 为完整错误 API，M2 起使用
 impl RecorderError {
     pub fn new(code: RecorderResult, message: impl Into<String>) -> Self {
         Self {
@@ -60,14 +59,6 @@ impl RecorderError {
 
     pub fn io(message: impl Into<String>) -> Self {
         Self::new(RecorderResult::Io, message)
-    }
-
-    pub fn no_encoder(message: impl Into<String>) -> Self {
-        Self::new(RecorderResult::NoEncoder, message)
-    }
-
-    pub fn device_lost(message: impl Into<String>) -> Self {
-        Self::new(RecorderResult::DeviceLost, message)
     }
 
     pub fn code(&self) -> RecorderResult {

@@ -2128,4 +2128,89 @@ mod tests {
         );
         assert!(n > 0, "不应把包全丢光");
     }
+
+    /// AV1 分片封装与切片验证：使用 build_av1c 构造 av01/av1C 的 SampleDescription，
+    /// 写入多分片 fMP4，验证其支持切片与收尾为普通 MP4。
+    #[test]
+    fn av1_fragmented_muxing_and_slicing() {
+        use crate::mux::extract::extract_range;
+        use crate::mux::nal::build_av1c;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("av1_live.mp4");
+        let slice_path = dir.path().join("av1_slice.mp4");
+
+        let av1c = build_av1c(&[]).expect("build_av1c 默认配置");
+        let desc = SampleDescription {
+            entry: *b"av01",
+            config_boxes: vec![av1c],
+            label: "Test AV1".into(),
+        };
+
+        let mut muxer =
+            Mp4Muxer::create_multi(&src_path, Some((320, 240, 30)), Some((2, 48_000))).unwrap();
+        muxer.set_video_description(desc).unwrap();
+
+        // 写入 60 帧（2 秒），每 15 帧一个关键帧
+        for i in 0..60u64 {
+            let is_key = i == 0 || i % 15 == 0;
+            // 模拟 AV1 OBU 样本
+            let sample_data = vec![0x12u8; 120];
+            muxer
+                .write_video_sample(&sample_data, i * 33_333, is_key)
+                .unwrap();
+            if i % 3 == 0 {
+                muxer.write_audio_sample(&[0x21u8; 100], i * 1024).unwrap();
+            }
+        }
+
+        // 文件保持在未 finish 的分片录制状态
+        let bytes_live = std::fs::read(&src_path).unwrap();
+        assert!(
+            bytes_live.windows(4).any(|w| w == b"moof"),
+            "录制中应包含 moof 分片"
+        );
+        assert!(
+            bytes_live.windows(4).any(|w| w == b"av01"),
+            "应包含 av01 entry"
+        );
+        assert!(
+            bytes_live.windows(4).any(|w| w == b"av1C"),
+            "应包含 av1C 配置盒"
+        );
+
+        // 关键动作 1：在分片录制中（未 finalize）验证切片
+        let slice_info = extract_range(&src_path, &slice_path, 500_000, 1_500_000, 30)
+            .expect("AV1 录制中切片应成功");
+        assert!(slice_info.sample_count > 0, "切片应包含样本");
+        let slice_bytes = std::fs::read(&slice_path).unwrap();
+        assert!(
+            slice_bytes.windows(4).any(|w| w == b"av01"),
+            "切片必须保留 av01 描述"
+        );
+        assert!(
+            slice_bytes.windows(4).any(|w| w == b"av1C"),
+            "切片必须保留 av1C 配置盒"
+        );
+
+        // 关键动作 2：正常结束录制做 soft remux 收尾
+        muxer.finish().unwrap();
+
+        let finalized_bytes = std::fs::read(&src_path).unwrap();
+        // 校验顶层盒：收尾后顶层盒只能是 ftyp、mdat、moov（moof 已被 mdat 吞并隐藏）
+        let mut kinds: Vec<[u8; 4]> = Vec::new();
+        let mut pos = 0usize;
+        while pos + 8 <= finalized_bytes.len() {
+            let size32 = u32::from_be_bytes(finalized_bytes[pos..pos + 4].try_into().unwrap());
+            let size = match size32 {
+                0 => finalized_bytes.len() - pos,
+                1 => u64::from_be_bytes(finalized_bytes[pos + 8..pos + 16].try_into().unwrap())
+                    as usize,
+                n => n as usize,
+            };
+            kinds.push(finalized_bytes[pos + 4..pos + 8].try_into().unwrap());
+            pos += size;
+        }
+        assert_eq!(kinds, vec![*b"ftyp", *b"mdat", *b"moov"]);
+    }
 }

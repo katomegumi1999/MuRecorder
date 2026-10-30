@@ -1,4 +1,4 @@
-# MuRecorder 构建脚本：cargo build --release → 复制到 ShawMuOCR/Libs/x64
+﻿# MuRecorder 构建脚本：cargo build --release → 复制到 ShawMuOCR/Libs/x64
 # 用法：powershell -ExecutionPolicy Bypass -File scripts\build.ps1 [-Configuration release|debug]
 param(
     [ValidateSet("release", "debug")]
@@ -21,10 +21,20 @@ if (-not (Test-Path (Join-Path $ShawMuOCRDir "ShawMuOCR.csproj"))) {
 }
 
 Write-Host "[MuRecorder] cargo build ($Configuration) ..."
-cargo build --$Configuration
-if ($LASTEXITCODE -ne 0) { throw "cargo build 失败" }
+Push-Location $coreDir
+try {
+    if ($Configuration -eq "Release") {
+        cargo build --release
+    } else {
+        cargo build
+    }
+    if ($LASTEXITCODE -ne 0) { throw "cargo build 失败" }
+} finally {
+    Pop-Location
+}
 
-$src = Join-Path $coreDir "target\$Configuration\$dllName"
+$sub = if ($Configuration -eq "Release") { "release" } else { "debug" }
+$src = Join-Path $coreDir "target\$sub\$dllName"
 if (-not (Test-Path $src)) { throw "找不到产物: $src" }
 
 if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
