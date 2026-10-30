@@ -41,7 +41,7 @@ use crate::mux::nal::annexb_to_mp4_sample;
 use crate::mux::remux::{finalize_fragmented, finalize_plain};
 
 use super::converter::{
-    CsNv12Converter, MfRuntimeGuard, create_cursor_staging_texture, create_render_texture,
+    GpuColorConverter, MfRuntimeGuard, create_cursor_staging_texture, create_render_texture,
 };
 use super::probe::has_hardware_encoder;
 use super::types::{ContainerMode, GpuCodec, sample_description};
@@ -73,7 +73,7 @@ pub struct GpuSinkWriter {
     desktop_valid: bool,
     /// 指针包围盒的 CPU 回读暂存纹理（尺寸随光标变化重建）。
     cursor_staging: Option<(ID3D11Texture2D, u32, u32)>,
-    converter: Option<CsNv12Converter>,
+    converter: Option<GpuColorConverter>,
     width: u32,
     height: u32,
     fps: u32,
@@ -130,10 +130,10 @@ impl GpuSinkWriter {
             // 1. 创建用于裁剪区域的显存目标纹理 (GPU VRAM 零拷贝承载)
             let cropped_texture = create_render_texture(device, aligned_width, aligned_height)?;
 
-            // 2. 若启用 H.264 / HEVC / AV1，构建 D3D11 Compute Shader 显存内高精度颜色转换器 (BGRA -> NV12)
-            // 采用 GPGPU 计算着色器，杜绝显卡驱动对 VideoProcessor 的视频增强与自动提亮滤镜，严格对齐 BT.709 标准
+            // 2. 若启用 H.264 / HEVC / AV1，构建自适应双保险颜色转换器 (BGRA -> NV12)
+            // 优先启用 D3D11 Compute Shader 直写 NV12，不支持 NV12 UAV 时自动平滑降级至纯净版 VideoProcessor
             let converter = if codec.requires_nv12() {
-                Some(CsNv12Converter::try_new(
+                Some(GpuColorConverter::try_new(
                     device,
                     context,
                     &cropped_texture,
