@@ -114,21 +114,22 @@ impl D3D11VideoConverter {
         }
 
         // (2) 输入流 (Stream 0): 桌面物理 BGRA 纹理为 sRGB / BT.709 Full Range (0-255)
-        // bit 0: Usage = 1 (Video processing/encoding)
+        // bit 0: Usage = 0 (Playback 标准视频渲染)
         // bit 1: RGB_Range = 0 (0-255 Full Range)
         // bit 2: YCbCr_Matrix = 1 (BT.709 高清标准矩阵)
         // bits 4-5: Nominal_Range = 2 (0-255 Full)
-        let in_cs = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 0x25 };
+        let in_cs = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 0x24 };
         unsafe {
             video_context.VideoProcessorSetStreamColorSpace(&processor, 0, &in_cs);
         }
 
-        // (3) 输出目标: NV12 显存目标为标准 BT.709 Studio Range (16-235)
-        // bit 0: Usage = 1
+        // (3) 输出目标: NV12 显存目标为高质量 BT.709 Full Range (0-255)
+        // 彻底解决屏幕录制动态范围压缩导致的画面泛白、浅淡与发灰问题，100% 还原桌面纯正黑度与高对比度
+        // bit 0: Usage = 0 (Playback)
         // bit 1: RGB_Range = 0
         // bit 2: YCbCr_Matrix = 1 (BT.709)
-        // bits 4-5: Nominal_Range = 1 (16-235 Studio/Limited Range)
-        let out_cs = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 0x15 };
+        // bits 4-5: Nominal_Range = 2 (0-255 Full Range)
+        let out_cs = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 0x24 };
         unsafe {
             video_context.VideoProcessorSetOutputColorSpace(&processor, &out_cs);
         }

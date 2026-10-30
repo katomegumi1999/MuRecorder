@@ -1118,7 +1118,7 @@ fn build_visual_sample_entry(
     build_box(entry, &p)
 }
 
-/// colr（nclx）：BT.709 原色 + BT.709 传输 + BT.709 矩阵 + 有限范围（16–235）。
+/// colr（nclx）：BT.709 原色 + BT.709 传输 + BT.709 矩阵 + 全范围（0–255）。
 fn build_colr() -> Vec<u8> {
     const PRIMARIES_BT709: u16 = 1;
     const TRANSFER_BT709: u16 = 1;
@@ -1128,7 +1128,7 @@ fn build_colr() -> Vec<u8> {
     p.extend_from_slice(&PRIMARIES_BT709.to_be_bytes());
     p.extend_from_slice(&TRANSFER_BT709.to_be_bytes());
     p.extend_from_slice(&MATRIX_BT709.to_be_bytes());
-    p.push(0); // full_range_flag = 0（limited range）
+    p.push(0x80); // full_range_flag = 1（full range 0-255）
     build_box(b"colr", &p)
 }
 
@@ -1511,7 +1511,7 @@ mod tests {
         assert_eq!(*types.last().unwrap(), b"moov");
     }
 
-    /// avc1 内必须带 colr(nclx) 且标注 BT.709 / limited range。
+    /// avc1 内必须带 colr(nclx) 且标注 BT.709 / full range。
     #[test]
     fn avc1_carries_bt709_colr_box() {
         let dir = tempfile::tempdir().unwrap();
@@ -1523,7 +1523,7 @@ mod tests {
         let matrix = u16::from_be_bytes(bytes[colr + 16..colr + 18].try_into().unwrap());
         assert_eq!(primaries, 1, "primaries 应为 BT.709");
         assert_eq!(matrix, 1, "matrix 应为 BT.709");
-        assert_eq!(bytes[colr + 18] & 0x80, 0, "应为 limited range");
+        assert_eq!(bytes[colr + 18] & 0x80, 0x80, "应为 full range");
     }
 
     /// 递归遍历 moov 盒树，校验每个 full 盒的 version 位置正确

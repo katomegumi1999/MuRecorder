@@ -25,7 +25,8 @@ impl GpuCodec {
     }
 
     pub fn requires_nv12(&self) -> bool {
-        matches!(self, Self::Hevc | Self::Av1)
+        // H.264、HEVC、AV1 在显卡硬件编码器层统一原生接入 NV12，通过 D3D11 VideoProcessor 完成显存硬件转换
+        true
     }
 
     pub fn name(&self) -> &'static str {

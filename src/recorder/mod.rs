@@ -172,8 +172,8 @@ impl Recorder {
                         }
                         EncoderPreference::GpuH264 => {
                             vec![
-                                (GpuCodec::H264, frag),
                                 (GpuCodec::H264, raw),
+                                (GpuCodec::H264, frag),
                                 (GpuCodec::H264, plain),
                             ]
                         }
@@ -181,6 +181,7 @@ impl Recorder {
                         _ => vec![
                             (GpuCodec::Av1, raw),
                             (GpuCodec::Hevc, raw),
+                            (GpuCodec::H264, raw),
                             (GpuCodec::H264, frag),
                             (GpuCodec::Av1, plain),
                             (GpuCodec::Hevc, plain),

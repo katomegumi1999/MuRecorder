@@ -23,7 +23,7 @@ use windows::Win32::Media::MediaFoundation::{
     MF_TRANSCODE_CONTAINERTYPE, MFAudioFormat_AAC, MFAudioFormat_PCM, MFCreateAttributes,
     MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateMemoryBuffer,
     MFCreateSample, MFCreateSinkWriterFromMediaSink, MFCreateSinkWriterFromURL, MFMediaType_Audio,
-    MFMediaType_Video, MFNominalRange_16_235, MFTranscodeContainerType_FMPEG4,
+    MFMediaType_Video, MFNominalRange_0_255, MFTranscodeContainerType_FMPEG4,
     MFTranscodeContainerType_MPEG4, MFVideoFormat_ARGB32, MFVideoFormat_AV1, MFVideoFormat_H264,
     MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709,
     MFVideoTransFunc_709, MFVideoTransferMatrix_BT709,
@@ -231,19 +231,18 @@ impl GpuSinkWriter {
             set_attribute_ratio(&out_type, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
             out_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
 
-            // 显式写入 BT.709 色彩标准与有限动态范围 (16-235) 元数据，杜绝播放器（Movies & TV、Edge、Chrome）泛白发灰
+            // 显式写入 BT.709 色彩标准与全动态范围 (0-255) 元数据，杜绝播放器泛白发灰
             out_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
             out_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
             out_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
-            out_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+            out_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255.0 as u32)?;
 
             let stream_index = sink_writer.AddStream(&out_type)?;
 
             // 7. 配置输入流格式
             // 核心要点：
-            // 若为 HEVC / AV1：直接告知 SinkWriter 输入为 MFVideoFormat_NV12！输入输出都是 NV12，
-            // 彻底杜绝 Media Foundation 自作主张插入软件颜色转换器导致与显卡驱动死锁。
-            // 若为 H.264：直接传入 ARGB32。
+            // H.264 / HEVC / AV1 统一在 GPU 显存内通过 D3D11 VideoProcessor 完成零拷贝硬件转换，
+            // 直接传入标准 NV12（Full Range 0-255），杜绝 MF 内部插入多余软件转换器导致死锁或色彩劣化。
             let in_type: IMFMediaType = MFCreateMediaType()?;
             in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
             if codec.requires_nv12() {
@@ -251,7 +250,7 @@ impl GpuSinkWriter {
                 in_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
                 in_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
                 in_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
-                in_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+                in_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255.0 as u32)?;
             } else {
                 in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_ARGB32)?;
             }
