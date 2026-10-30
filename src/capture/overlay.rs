@@ -489,47 +489,70 @@ fn draw_light_trail(
         alpha: f32,
     }
 
-    let mut nodes = Vec::with_capacity(trail.len() + 1);
+    // 1. 过滤采样历史点：去除微小抖动的密集点（距离 < 3.0px），防止微步移动时大量端点扎堆堆积
+    let mut raw_nodes: Vec<TrailNode> = Vec::with_capacity(trail.len() + 1);
     for &(tx, ty, a) in trail {
         let norm_a = a as f32 / 255.0;
-        let radius = 0.8 + 2.8 * norm_a;
-        let alpha = (a as f32 * 0.9).clamp(0.0, 255.0);
-        nodes.push(TrailNode {
-            x: (tx + hx) as f32,
-            y: (ty + hy) as f32,
+        let px = (tx + hx) as f32;
+        let py = (ty + hy) as f32;
+        if let Some(last) = raw_nodes.last() {
+            let dx = px - last.x;
+            let dy = py - last.y;
+            if dx * dx + dy * dy < 9.0 {
+                continue;
+            }
+        }
+        let radius = 1.0 + 3.4 * norm_a;
+        let alpha = (a as f32 * 0.95).clamp(0.0, 255.0);
+        raw_nodes.push(TrailNode {
+            x: px,
+            y: py,
             radius,
             alpha,
         });
     }
 
+    // 2. 连接当前鼠标头部尖端
     if let Some((mx, my)) = main {
         let head_x = (mx + hx) as f32;
         let head_y = (my + hy) as f32;
-        let should_add = match nodes.last() {
+        match raw_nodes.last_mut() {
             Some(last) => {
                 let dx = head_x - last.x;
                 let dy = head_y - last.y;
-                dx * dx + dy * dy >= 1.0
+                if dx * dx + dy * dy >= 4.0 {
+                    raw_nodes.push(TrailNode {
+                        x: head_x,
+                        y: head_y,
+                        radius: 4.4,
+                        alpha: 235.0,
+                    });
+                } else {
+                    // 微小距离内直接推进尾端点到当前热点，保证光轨 100% 紧贴鼠标尖端流出
+                    last.x = head_x;
+                    last.y = head_y;
+                    last.radius = 4.4;
+                    last.alpha = 235.0;
+                }
             }
-            None => true,
-        };
-        if should_add {
-            nodes.push(TrailNode {
-                x: head_x,
-                y: head_y,
-                radius: 3.8,
-                alpha: 220.0,
-            });
+            None => {
+                raw_nodes.push(TrailNode {
+                    x: head_x,
+                    y: head_y,
+                    radius: 4.4,
+                    alpha: 235.0,
+                });
+            }
         }
     }
 
-    if nodes.is_empty() {
+    if raw_nodes.len() < 2 {
         return 0;
     }
 
     // 使用 Chaikin 拐角细分平滑算法：将折线自然过渡为连续圆润的流线，且绝对不产生样条外拱自交
-    let curved_nodes = if nodes.len() >= 3 {
-        let mut cur = nodes;
+    let curved_nodes = if raw_nodes.len() >= 3 {
+        let mut cur = raw_nodes;
         for _ in 0..2 {
             let mut next = Vec::with_capacity(cur.len() * 2);
             if let Some(first) = cur.first() {
@@ -558,7 +581,7 @@ fn draw_light_trail(
         }
         cur
     } else {
-        nodes
+        raw_nodes
     };
 
     let w = canvas.width as i32;
@@ -570,8 +593,8 @@ fn draw_light_trail(
 
     let mut touched = 0usize;
 
-    let seg_count = if curved_nodes.len() == 1 { 1 } else { curved_nodes.len() - 1 };
-    let glow_pad = 2.4f32;
+    let seg_count = curved_nodes.len() - 1;
+    let glow_pad = 2.8f32;
 
     #[derive(Clone, Copy)]
     struct Segment {
@@ -598,7 +621,7 @@ fn draw_light_trail(
 
     for i in 0..seg_count {
         let p0 = &curved_nodes[i];
-        let p1 = if curved_nodes.len() == 1 { p0 } else { &curved_nodes[i + 1] };
+        let p1 = &curved_nodes[i + 1];
 
         let dx = p1.x - p0.x;
         let dy = p1.y - p0.y;
@@ -650,8 +673,9 @@ fn draw_light_trail(
         for tx in x0..x1 {
             let px = tx as f32 + origin.0 as f32 + 0.5;
 
-            // 遍历所有相交线段，挑选视觉贡献最强（最高 Alpha / 核心度）的线段，严格单次合成
-            let mut best_color: Option<([u8; 3], f32)> = None;
+            // 寻找最匹配的光轨线段。评分以「靠近中心脊线（proximity 权重最高）」为主，
+            // 彻底杜绝端点胶囊圆头因为自身整体 Alpha 较高而反噬覆盖相邻线段纯白核心的念珠状伪影。
+            let mut best_candidate: Option<([u8; 3], f32, f32)> = None;
 
             for seg in &segments {
                 if px < seg.min_x || px > seg.max_x || py < seg.min_y || py > seg.max_y {
@@ -686,33 +710,38 @@ fn draw_light_trail(
                     // 内芯：纯白高亮
                     ([255u8, 255, 255], a_seg)
                 } else if dist <= r {
-                    // 核心到光柱边缘：白 -> 青蓝 [255, 229, 0] (BGRA)
+                    // 核心到光柱边缘：纯白 -> 青蓝 [255, 229, 0] (BGRA 顺序) 平滑过渡
                     let u = (dist - r_core) / (r - r_core);
-                    let g = (255.0 - 26.0 * u).round() as u8;
-                    let r_ch = (255.0 * (1.0 - u)).round() as u8;
+                    let u_smooth = u * u * (3.0 - 2.0 * u);
+                    let g = (255.0 - 26.0 * u_smooth).round() as u8;
+                    let r_ch = (255.0 * (1.0 - u_smooth)).round() as u8;
                     ([255u8, g, r_ch], a_seg)
                 } else {
-                    // 光晕：青蓝色渐隐软过渡
+                    // 光晕：青蓝色渐隐软过渡，边缘平滑衰减至 0
                     let u = (dist - r) / glow_pad;
                     let cov = (1.0 - u).clamp(0.0, 1.0);
                     let smooth_cov = cov * cov * (3.0 - 2.0 * cov);
-                    ([255u8, 229, 0], a_seg * smooth_cov * 0.7)
+                    ([255u8, 229, 0], a_seg * smooth_cov)
                 };
 
                 if alpha <= 0.5 {
                     continue;
                 }
 
-                match &mut best_color {
-                    None => best_color = Some((color, alpha)),
-                    Some((_, best_a)) if alpha > *best_a => {
-                        best_color = Some((color, alpha));
+                // 评分 = 有效 Alpha * (1.0 - dist / r_glow)，中心核心评分最高，在相邻线段接缝处严密无缝
+                let proximity = (1.0 - dist / r_glow).max(0.0);
+                let score = alpha * proximity;
+
+                match &mut best_candidate {
+                    None => best_candidate = Some((color, alpha, score)),
+                    Some((_, _, best_score)) if score > *best_score => {
+                        best_candidate = Some((color, alpha, score));
                     }
                     _ => {}
                 }
             }
 
-            if let Some((color, alpha)) = best_color {
+            if let Some((color, alpha, _)) = best_candidate {
                 let off = row_off + tx as usize * 4;
                 if off + 3 < dst.len() {
                     let a = alpha.min(255.0);
@@ -1336,5 +1365,50 @@ mod tests {
         assert_ne!(mid, (0x10, 0x10, 0x10), "光轨路径点应被着色");
         // 远离光轨的像素保持原样
         assert_eq!(px(90, 10), (0x10, 0x10, 0x10), "远离光轨处不应被修改");
+    }
+
+    /// 流光光轨：在连续移动路径上形成均匀无接缝的流线光带，绝无断续的念珠状圆点伪影。
+    #[test]
+    fn light_trail_continuous_without_bead_artifacts() {
+        let w = 120u32;
+        let h = 60u32;
+        let mut buf = vec![0x00u8; (w * h * 4) as usize];
+        let shape = color_shape(8, 8);
+        // 水平拉一条连续移动轨迹
+        let plan = OverlayPlan {
+            shape: Some(&shape),
+            trail: vec![
+                (20, 30, 80),
+                (35, 30, 120),
+                (50, 30, 160),
+                (65, 30, 200),
+            ],
+            ripples: Vec::new(),
+            main: Some((80, 30)),
+        };
+        let mut canvas = Canvas::new(&mut buf, (w * 4) as usize, w, h);
+        let touched = plan.draw_into(&mut canvas, (0, 0));
+        assert!(touched > 0);
+
+        let px = |x: u32, y: u32| {
+            let off = (y * w * 4 + x * 4) as usize;
+            (buf[off], buf[off + 1], buf[off + 2]) // (B, G, R)
+        };
+
+        // 沿中心脊线 y=30，从 x=25 到 x=75，所有像素都必须有稳定的纯白或高亮着色，且无全黑空洞
+        for x in 25..=75 {
+            let (b, g, r) = px(x, 30);
+            assert!(
+                b > 30,
+                "中心脊线 x={x} 处不应产生断裂或全黑缝隙 (B={b})"
+            );
+            // 靠近头部的核心区应该是亮白 (B, G, R 均极高)
+            if x >= 65 {
+                assert!(
+                    r > 150 && g > 150 && b > 180,
+                    "头部核心区 x={x} 应呈现白芯高光: ({b}, {g}, {r})"
+                );
+            }
+        }
     }
 }
